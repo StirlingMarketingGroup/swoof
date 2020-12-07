@@ -65,7 +65,7 @@ This has the same effect as an empty DSN string:
 ```
 ```
 
-Using the DNS you can also tweak the packet size that's used. If you're running into deadlock issues or other issues, you can try to tune the packet size down by setting the packet size in the DNS like so.
+Using the DSN you can also tweak the packet size that's used. If you're running into deadlock issues or other issues, you can try to tune the packet size down by setting the packet size in the DSN like so.
 
 ##### `maxAllowedPacket`
 ```
