@@ -49,6 +49,10 @@ var (
 
 func main() {
 	root.ParseArgs(os.Args...)
+	if len(*args) < 3 {
+		root.Usage()
+		os.Exit(1)
+	}
 
 	var guard = make(chan struct{}, *threads)
 
@@ -59,11 +63,6 @@ func main() {
 	tables := make([]string, 0, len(tablesMap))
 	for t := range tablesMap {
 		tables = append(tables, t)
-	}
-
-	if len(*args) < 3 {
-		root.Usage()
-		os.Exit(1)
 	}
 
 	src, err := mysql.NewFromDSN((*args)[0], (*args)[0])
