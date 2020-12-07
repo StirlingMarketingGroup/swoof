@@ -61,7 +61,7 @@ func main() {
 	pb := mpb.New(mpb.WithWaitGroup(&wg))
 
 	for tableName := range tablesMap {
-		// ensure we only run up to our max improts at a time
+		// ensure we only run up to our max imports at a time
 		guard <- struct{}{}
 
 		// this makes sure we capture tableName in a way that it doesn't
