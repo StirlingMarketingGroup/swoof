@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"reflect"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,10 +34,6 @@ func (yn *yesNo) Scan(src interface{}) error {
 
 	return errors.Errorf("cannot scan %q of type %T as a yes/no", src, src)
 }
-
-var keysStartRegexp = regexp.MustCompile(`,\n {2}KEY`)
-var keysEndRegexp = regexp.MustCompile(`\).+$`)
-var fulltextsRegexp = regexp.MustCompile(`(?m)^add {2}FULLTEXT .+,?$`)
 
 var (
 	root = cmd.New()
@@ -222,14 +217,6 @@ func main() {
 				panic(err)
 			}
 
-			start := keysStartRegexp.FindStringIndex(table.CreateMySQL)
-			end := keysEndRegexp.FindStringIndex(table.CreateMySQL)
-			var keys string
-			if len(start) > 0 && len(end) > 0 {
-				keys = table.CreateMySQL[start[0]:end[0]]
-				table.CreateMySQL = table.CreateMySQL[:start[0]] + table.CreateMySQL[end[0]:]
-			}
-
 			err = dst.Exec(table.CreateMySQL)
 			if err != nil {
 				panic(err)
@@ -273,28 +260,6 @@ func main() {
 			}
 
 			bar.SetTotal(bar.Current(), true)
-
-			if len(keys) != 0 {
-				keys = "alter table`" + tableName + "`" + strings.ReplaceAll(keys[1:len(keys)-1], "\n", "\nadd")
-				locs := fulltextsRegexp.FindAllStringIndex(keys, -1)
-				if len(locs) > 1 {
-					locs = locs[1:]
-					for i := len(locs) - 1; i >= 0; i-- {
-						l := locs[i]
-
-						err := dst.Exec("alter table`" + tableName + "`" + strings.TrimRight(keys[l[0]:l[1]], ","))
-						if err != nil {
-							panic(err)
-						}
-						keys = keys[:l[0]] + keys[l[1]:]
-					}
-				}
-
-				err := dst.Exec(keys)
-				if err != nil {
-					panic(err)
-				}
-			}
 
 			triggers := make(chan struct {
 				Trigger string
