@@ -1,6 +1,8 @@
 package main
 
 import (
+	"io/ioutil"
+	"net/url"
 	"os"
 	"reflect"
 	"strconv"
@@ -11,26 +13,91 @@ import (
 	dynamicstruct "github.com/Ompluscator/dynamic-struct"
 	mysql "github.com/StirlingMarketingGroup/cool-mysql"
 	"github.com/fatih/color"
+	baseMySQL "github.com/go-sql-driver/mysql"
 	"github.com/pkg/errors"
 	"github.com/posener/cmd"
 	"github.com/vbauerster/mpb/v5"
 	"github.com/vbauerster/mpb/v5/decor"
+	"gopkg.in/yaml.v2"
 )
+
+var confDir, _ = os.UserConfigDir()
 
 var (
 	root = cmd.New()
 
+	connectionsFile = root.String("c", confDir+"/swoof/connections.yaml", "your connections file")
+
 	skipData = root.Bool("n", false, "drop/create tables and triggers only, without importing data")
 
-	threads = root.Int("t", 4, "max concurrent tables at the same time. Anything more than 4 seems to crash things")
+	threads = root.Int("t", 4, "max concurrent tables at the same time, import stability may vary wildly between servers while increasing this")
 
 	// not entirely sure how much this really affects performance,
 	// since the performance bottleneck is almost guaranteed to be writing
 	// the rows to the source
 	rowBufferSize = root.Int("r", 50, "max rows buffer size. Will have this many rows downloaded and ready for importing")
 
-	args = root.Args("source, dest, tables", "source, dest, tables, ex:\n'user:pass@(host)/dbname' 'user:pass@(host)/dbname' table1 table2 table3\n\nsee: https://github.com/go-sql-driver/mysql#dsn-data-source-name")
+	tempTablePrefix = root.String("p", "_swoof_", "prefix of the temp table used for initial creation before the swap and drop")
+
+	args = root.Args("source, dest, tables", "source, dest, tables, ex:\n"+
+		"swoof [flags] 'user:pass@(host)/dbname' 'user:pass@(host)/dbname' table1 table2 table3\n\n"+
+		"see: https://github.com/go-sql-driver/mysql#dsn-data-source-name\n\n"+
+		"Or, optionally, you can use your connections in your connections file like so:\n\n"+
+		"swoof [flags] production localhost table1 table2 table3")
 )
+
+type connection struct {
+	User   string            `yaml:"user"`
+	Pass   string            `yaml:"pass"`
+	Host   string            `yaml:"host"`
+	Schema string            `yaml:"schema"`
+	Params map[string]string `yaml:"params"`
+
+	SourceOnly bool `yaml:"source_only"`
+	DestOnly   bool `yaml:"dest_only"`
+}
+
+// getConnections returns our connection map that's
+// parsed from the user's config dir,
+// makes calls to swoof much shorter and much easier
+// and even a little safer potentially
+func getConnections(file string) (connections map[string]connection, err error) {
+	y, err := ioutil.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	err = yaml.Unmarshal(y, &connections)
+	if err != nil {
+		return nil, err
+	}
+
+	return
+}
+
+// connectionToDSN converts our own connection structs to the
+// official mysql's own connection struct, formatted for our use case
+func connectionToDSN(c connection) string {
+	d := baseMySQL.NewConfig()
+	d.User = c.User
+	d.Passwd = c.Pass
+	d.Net = "tcp"
+	d.Addr = c.Host
+	d.DBName = c.Schema
+
+	dsn := d.FormatDSN()
+	i := 0
+	for k, v := range c.Params {
+		if i == 0 {
+			dsn += "?"
+		} else {
+			dsn += "&"
+		}
+		dsn += url.QueryEscape(k) + "=" + url.QueryEscape(v)
+		i++
+	}
+
+	return dsn
+}
 
 func main() {
 	root.ParseArgs(os.Args...)
@@ -49,9 +116,32 @@ func main() {
 		tablesMap[t] = struct{}{}
 	}
 
+	sourceDSN := (*args)[0]
+	destDSN := (*args)[1]
+
+	// lookup connection information in the users config file
+	// for much easier and shorter (and probably safer) command usage
+	if connections, err := getConnections(*connectionsFile); err == nil {
+		if c, ok := connections[sourceDSN]; ok {
+			if c.DestOnly {
+				panic(errors.Errorf("can't use %q as a source per your config", sourceDSN))
+			}
+
+			sourceDSN = connectionToDSN(c)
+		}
+
+		if c, ok := connections[destDSN]; ok {
+			if c.SourceOnly {
+				panic(errors.Errorf("can't use %q as a destination per your config", destDSN))
+			}
+
+			destDSN = connectionToDSN(c)
+		}
+	}
+
 	// source connection is the first argument
 	// this is where our rows are coming from
-	src, err := mysql.NewFromDSN((*args)[0], (*args)[0])
+	src, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
 	if err != nil {
 		panic(err)
 	}
@@ -161,6 +251,8 @@ func main() {
 
 				// the switch through data types (differnet than column types, doesn't include lengths)
 				// to determine the type of our struct field
+				// All of the field types are pointers so that our mysql scanning
+				// handles null values gracefully
 				switch c.DataType {
 				case "tinyint":
 					if unsigned {
@@ -198,6 +290,9 @@ func main() {
 					var v *float64
 					rowStruct.AddField(f, v, tag)
 				case "decimal":
+					// our cool mysql literal is exactly what it sounds like;
+					// passed directly into the query with no escaping, which is know is
+					// safe here because a decimal from mysql can't contain breaking characters
 					var v *mysql.Literal
 					rowStruct.AddField(f, v, tag)
 				case "timestamp", "date", "datetime":
@@ -234,7 +329,7 @@ func main() {
 			// we need to be able to set foreign keys off, and the connection pooling
 			// by default makes this difficult. So instead we declare it here, and turn off
 			// pooling, almost creating our own "ppol"
-			dst, err := mysql.NewFromDSN((*args)[1], (*args)[1])
+			dst, err := mysql.NewFromDSN(destDSN, destDSN)
 			if err != nil {
 				panic(err)
 			}
@@ -245,21 +340,6 @@ func main() {
 			// will almost certainly run into problems otherwise. Also dropping the table
 			// will do the same
 			err = dst.Exec("set`FOREIGN_KEY_CHECKS`=0")
-			if err != nil {
-				panic(err)
-			}
-
-			// delete the table from our destination
-			err = dst.Exec("drop table if exists`" + tableName + "`")
-			if err != nil {
-				panic(err)
-			}
-
-			// now we get the table creation syntax from our source
-			var table struct {
-				CreateMySQL string `mysql:"Create Table"`
-			}
-			err = src.Select(&table, "show create table`"+tableName+"`", 0)
 			if err != nil {
 				panic(err)
 			}
@@ -297,8 +377,53 @@ func main() {
 				),
 			)
 
+			// now we get the table creation syntax from our source
+			var table struct {
+				CreateMySQL string `mysql:"Create Table"`
+			}
+			err = src.Select(&table, "show create table`"+tableName+"`", 0)
+			if err != nil {
+				panic(err)
+			}
+
+			tempTableName := *tempTablePrefix + tableName
+
+			// delete the table from our destination
+			err = dst.Exec("drop table if exists`" + tempTableName + "`")
+			if err != nil {
+				panic(err)
+			}
+
+			// since foreign key constraints have globally unique names (for some reason)
+			// we can't just create our temp table with constraints because
+			// the names will likely conflict with the table that already exists
+
+			// so we will strip the constraints here and add them back once we're done
+			var constraints string
+
+			// we can safely assume the constraints start like this because you can't
+			// constraints without columns!
+			constraintsStart := strings.Index(table.CreateMySQL, ",\n  CONSTRAINT ")
+			if constraintsStart != -1 {
+				// we have the start of our constraints block, and since mysql
+				// always (hopefully) gives them in a block, we can find the last
+				// constraint and everything in the middle is what we want
+				constraintsEnd := strings.LastIndex(table.CreateMySQL, ",\n  CONSTRAINT ")
+
+				// but we need the end of the line, so we'll get the byte index of the newline
+				// after our last index as our end marker
+				constraintsEnd = constraintsEnd + strings.IndexByte(table.CreateMySQL[constraintsEnd+2:], '\n') + 2
+
+				// then we can keep track of our constraints so we can add them back
+				// to our table once we've dropped the original table
+				constraints = table.CreateMySQL[constraintsStart:constraintsEnd]
+
+				// and store our create query without our constraints
+				table.CreateMySQL = table.CreateMySQL[:constraintsStart] + table.CreateMySQL[constraintsEnd:]
+			}
+
 			// now we can make the table on our destination
-			err = dst.Exec(table.CreateMySQL)
+			err = dst.Exec("CREATE TABLE `" + tempTableName + "`" + strings.TrimPrefix(table.CreateMySQL, "CREATE TABLE `"+tableName+"`"))
 			if err != nil {
 				panic(err)
 			}
@@ -308,7 +433,7 @@ func main() {
 				// Now this *does* have to be chunked because there's no way to stream
 				// rows to mysql, but cool mysql handles this for us, all it needs is the same
 				// channel we got from the select
-				err = dst.InsertWithRowComplete("insert into`"+tableName+"`", columnNames, ch, func(start time.Time) {
+				err = dst.InsertWithRowComplete("insert into`"+tempTableName+"`", columnNames, ch, func(start time.Time) {
 					bar.Increment()
 					bar.DecoratorEwmaUpdate(time.Since(start))
 				})
@@ -320,6 +445,34 @@ func main() {
 			// and just in case the rows have changed count since our count selection,
 			// we'll just tell the progress bar that we're finished
 			bar.SetTotal(bar.Current(), true)
+
+			// drop the old table now that our temp table is done
+			err = dst.Exec("drop table if exists`" + tableName + "`")
+			if err != nil {
+				panic(err)
+			}
+
+			// rename our temp table to the real table name
+			// we could do an atomic rename here, but the problem is that atomic renames
+			// also rename all the constraints of other tables pointing to our original table, and
+			// we want those constraints to point to our new table instead
+
+			// if you're doing this live, there *is* some down time, but other tools handle this the same
+			// way, so I don't think it's unreasonable if we do the same
+			err = dst.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`")
+			if err != nil {
+				panic(err)
+			}
+
+			// no we can add back our constraints if we have them
+			// converting our constraints to alter table syntax by removing our leading
+			// comma and adding the word "add" at the beginning of each line
+			if len(constraints) != 0 {
+				err = dst.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd"))
+				if err != nil {
+					panic(err)
+				}
+			}
 
 			// but we can't forget our triggers!
 			// lets grab the triggers from the source table and make sure
