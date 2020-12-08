@@ -328,7 +328,7 @@ func main() {
 			// we make the dest connection in the loop, once per table, because
 			// we need to be able to set foreign keys off, and the connection pooling
 			// by default makes this difficult. So instead we declare it here, and turn off
-			// pooling, almost creating our own "ppol"
+			// pooling, almost creating our own "pool"
 			dst, err := mysql.NewFromDSN(destDSN, destDSN)
 			if err != nil {
 				panic(err)

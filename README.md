@@ -6,6 +6,8 @@ Just swoof it in. Ultra fast MySQL table importer. But not too fast.
 
 This still uses MySQL commands to do the importing, so it wont be as quick as, say, the Percona xtra-backup tool, but because it uses queries, this will work across a broad range of MySQL versions.
 
+Also, `swoof` doesn't import tables over top of existing tables like `mysqldump` does, but instead writes to a temp table, and once completed, drops and renames the temp table to match the original, so long imports don't interfere with working on your dev system.
+
 ---
 
 ## Dependencies
@@ -30,19 +32,60 @@ export PATH=$PATH:$GOPATH/bin
 ## Usage
 
 ```shell
-swoof [-n -r 50 -t 4] 'user:pass@(host)/dbname' 'user:pass@(host)/dbname' table1 table2 table3
+swoof [flags] 'user:pass@(host)/dbname' 'user:pass@(host)/dbname' table1 table2 table3
+# or, with a connections file
+swoof [flags] production localhost table1 table2 table3
 ```
 ### Flags:
 
-  - `-n`    drop/create tables and triggers only, without importing data
+  - `-c` your connections file (default `~/.config/swoof/connections.yaml` on Linux, more info below)
+  - `-n` drop/create tables and triggers only, without importing data
+  - `-p` prefix of the temp table used for initial creation before the swap and drop (default `_swoof_`)
   - `-r` value
         max rows buffer size. Will have this many rows downloaded and ready for importing, or in Go terms, the channel size used to communicate the rows (default 50)
   - `-t` value
         max concurrent tables at the same time. Anything more than 4 seems to crash things, so YMMV (default 4)
 
+### Using a connections file
+
+You can use a `connections.yaml` file that looks like this to describe preset connections for easier use
+
+```yaml
+production:
+  user: root
+  pass: super secret password
+  host: my-live.db:3307
+  schema: cooldb
+  source_only: true
+localhost:
+  user: root
+  pass: correct horse battery staple
+  host: 127.0.0.1
+  schema: cooldb
+  dest_only: true
+  params:
+    maxAllowedPacket: 1048576
+```
+
+You can also set `source_only` and `dest_only` per connection to make sure that accidental use of a source connection, like a production server, doesn't get written to by mistake.
+
+This file is located using Golangs `os.UserConfigDir()`.
+
+> UserConfigDir returns the default root directory to use
+> for user-specific configuration data.
+> Users should create their own application-specific
+> subdirectory within this one and use that.
+> On Unix systems, it returns $XDG_CONFIG_HOME as specified by
+> https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
+> if non-empty, else $HOME/.config.
+> On Darwin, it returns $HOME/Library/Application Support.
+> On Windows, it returns %AppData%. On Plan 9, it returns $home/lib.
+
+If you run `swoof` with no arguments, it will list the default on your system under the flag descriptions. You can specify your own location with the `-c` flag.
+
 ### DSN (Data Source Name)
 
-Source and destination strings are DSNs. The Data Source Name has a common format, like e.g. [PEAR DB](http://pear.php.net/manual/en/package.database.db.intro-dsn.php) uses it, but without type-prefix (optional parts marked by squared brackets):
+Source and destination strings can also be DSNs. The Data Source Name has a common format, like e.g. [PEAR DB](http://pear.php.net/manual/en/package.database.db.intro-dsn.php) uses it, but without type-prefix (optional parts marked by squared brackets):
 ```
 [username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]
 ```

@@ -5,7 +5,6 @@ go 1.15
 require (
 	github.com/Ompluscator/dynamic-struct v1.2.0
 	github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20201207145913-c6a3d3f0ece8
-	github.com/davecgh/go-spew v1.1.1
 	github.com/fatih/color v1.7.0
 	github.com/go-sql-driver/mysql v1.5.0
 	github.com/mattn/go-colorable v0.1.2 // indirect
