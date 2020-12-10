@@ -47,6 +47,8 @@ var (
 func main() {
 	start := time.Now()
 
+	// parse our command line arguments and make sure we
+	// were given something that makes sense
 	root.ParseArgs(os.Args...)
 	if len(*args) < 3 {
 		root.Usage()
@@ -87,6 +89,8 @@ func main() {
 		panic(err)
 	}
 
+	// loop though the tables we were given and make sure they
+	// all exist, throw errors for ones that don't before we start
 	for _, t := range (*args)[2:] {
 		if ok, err := src.Exists("show tables like'"+t+"'", 0); err != nil {
 			panic(err)
@@ -95,6 +99,10 @@ func main() {
 		}
 	}
 
+	// and now we can get our tables ordered by the largest physical tables first
+	// this *should* help performance, so that the longest table doesn't start last
+	// and draw out the total process time
+	// this also has the nice ideside effect of de-duplicating our tables list
 	tables := make(chan struct {
 		TableName string `mysql:"table_name"`
 	})
@@ -326,6 +334,8 @@ func main() {
 				panic(err)
 			}
 
+			// our pretty bar config for the progress bars
+			// their documention lives over here https://github.com/vbauerster/mpb
 			bar := pb.AddBar(count.Count,
 				mpb.BarStyle("|▇▇ |"),
 				mpb.PrependDecorators(
