@@ -95,11 +95,10 @@ func main() {
 		}
 	}
 
-	tables := make([]struct {
+	tables := make(chan struct {
 		TableName string `mysql:"table_name"`
-		bar       *mpb.Bar
-	}, 0)
-	err = src.Select(&tables, "select`table_name`"+
+	})
+	err = src.Select(tables, "select`table_name`"+
 		"from`information_schema`.`TABLES`"+
 		"where`table_schema`=database()"+
 		"and`table_name`in(@@Tables)"+
@@ -114,29 +113,11 @@ func main() {
 	var wg sync.WaitGroup
 	pb := mpb.New(mpb.WithWaitGroup(&wg))
 
-	for i, table := range tables {
-		// our pretty bar config for the progress bars
-		// their documention lives over here https://github.com/vbauerster/mpb
-		tables[i].bar = pb.AddBar(0,
-			mpb.BarStyle("|▇▇ |"),
-			mpb.PrependDecorators(
-				decor.Name(color.HiBlueString(table.TableName)),
-				decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
-			),
-			mpb.AppendDecorators(
-				decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", ", decor.WCSyncWidth),
-				decor.AverageSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", decor.WCSyncWidth),
-				decor.AverageETA(decor.ET_STYLE_MMSS),
-			),
-		)
-	}
-
-	for _, table := range tables {
+	for table := range tables {
 		// this makes sure we capture tableName in a way that it doesn't
 		// change on us within our loop
 		// And IMO this is cleaner than having the func below accept the string
 		tableName := table.TableName
-		bar := table.bar
 
 		// ensure we only run up to our max imports at a time
 		guard <- struct{}{}
@@ -345,8 +326,18 @@ func main() {
 				panic(err)
 			}
 
-			// update the bar count to the total now that we know it
-			bar.SetTotal(count.Count, false)
+			bar := pb.AddBar(count.Count,
+				mpb.BarStyle("|▇▇ |"),
+				mpb.PrependDecorators(
+					decor.Name(color.HiBlueString(tableName)),
+					decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
+				),
+				mpb.AppendDecorators(
+					decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", ", decor.WCSyncWidth),
+					decor.AverageSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", decor.WCSyncWidth),
+					decor.AverageETA(decor.ET_STYLE_MMSS),
+				),
+			)
 
 			// now we get the table creation syntax from our source
 			var table struct {
