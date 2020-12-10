@@ -19,6 +19,7 @@ You will need Golang, which you can get from here https://golang.org/doc/install
 ```shell
 cd ~ # or wherever you store your git projects
 git clone https://github.com/StirlingMarketingGroup/swoof.git
+cd swoof
 go install
 ```
 
