@@ -1,8 +1,7 @@
 package main
 
 import (
-	"io/ioutil"
-	"net/url"
+	"fmt"
 	"os"
 	"reflect"
 	"strconv"
@@ -12,13 +11,12 @@ import (
 
 	dynamicstruct "github.com/Ompluscator/dynamic-struct"
 	mysql "github.com/StirlingMarketingGroup/cool-mysql"
+	"github.com/dustin/go-humanize/english"
 	"github.com/fatih/color"
-	baseMySQL "github.com/go-sql-driver/mysql"
 	"github.com/pkg/errors"
 	"github.com/posener/cmd"
 	"github.com/vbauerster/mpb/v5"
 	"github.com/vbauerster/mpb/v5/decor"
-	"gopkg.in/yaml.v2"
 )
 
 var confDir, _ = os.UserConfigDir()
@@ -46,60 +44,9 @@ var (
 		"swoof [flags] production localhost table1 table2 table3")
 )
 
-type connection struct {
-	User   string            `yaml:"user"`
-	Pass   string            `yaml:"pass"`
-	Host   string            `yaml:"host"`
-	Schema string            `yaml:"schema"`
-	Params map[string]string `yaml:"params"`
-
-	SourceOnly bool `yaml:"source_only"`
-	DestOnly   bool `yaml:"dest_only"`
-}
-
-// getConnections returns our connection map that's
-// parsed from the user's config dir,
-// makes calls to swoof much shorter and much easier
-// and even a little safer potentially
-func getConnections(file string) (connections map[string]connection, err error) {
-	y, err := ioutil.ReadFile(file)
-	if err != nil {
-		return nil, err
-	}
-	err = yaml.Unmarshal(y, &connections)
-	if err != nil {
-		return nil, err
-	}
-
-	return
-}
-
-// connectionToDSN converts our own connection structs to the
-// official mysql's own connection struct, formatted for our use case
-func connectionToDSN(c connection) string {
-	d := baseMySQL.NewConfig()
-	d.User = c.User
-	d.Passwd = c.Pass
-	d.Net = "tcp"
-	d.Addr = c.Host
-	d.DBName = c.Schema
-
-	dsn := d.FormatDSN()
-	i := 0
-	for k, v := range c.Params {
-		if i == 0 {
-			dsn += "?"
-		} else {
-			dsn += "&"
-		}
-		dsn += url.QueryEscape(k) + "=" + url.QueryEscape(v)
-		i++
-	}
-
-	return dsn
-}
-
 func main() {
+	start := time.Now()
+
 	root.ParseArgs(os.Args...)
 	if len(*args) < 3 {
 		root.Usage()
@@ -109,12 +56,6 @@ func main() {
 	// guard channel of structs makes sure we can easily block for
 	// running only a max number of goroutines at a time
 	var guard = make(chan struct{}, *threads)
-
-	// we're making a table map so we can efficiently de-duplicate the list of tables
-	tablesMap := make(map[string]struct{})
-	for _, t := range (*args)[2:] {
-		tablesMap[t] = struct{}{}
-	}
 
 	sourceDSN := (*args)[0]
 	destDSN := (*args)[1]
@@ -146,18 +87,60 @@ func main() {
 		panic(err)
 	}
 
+	for _, t := range (*args)[2:] {
+		if ok, err := src.Exists("show tables like'"+t+"'", 0); err != nil {
+			panic(err)
+		} else if !ok {
+			panic(errors.Errorf("table %q does not exist on the source connection", t))
+		}
+	}
+
+	tables := make([]struct {
+		TableName string `mysql:"table_name"`
+		bar       *mpb.Bar
+	}, 0)
+	err = src.Select(&tables, "select`table_name`"+
+		"from`information_schema`.`TABLES`"+
+		"where`table_schema`=database()"+
+		"and`table_name`in(@@Tables)"+
+		"order by`data_length`+`index_length`desc", 0, mysql.Params{
+		"Tables": (*args)[2:],
+	})
+	if err != nil {
+		panic(err)
+	}
+
 	// our multi-progress bar ties right into our wait group
 	var wg sync.WaitGroup
 	pb := mpb.New(mpb.WithWaitGroup(&wg))
 
-	for tableName := range tablesMap {
-		// ensure we only run up to our max imports at a time
-		guard <- struct{}{}
+	for i, table := range tables {
+		// our pretty bar config for the progress bars
+		// their documention lives over here https://github.com/vbauerster/mpb
+		tables[i].bar = pb.AddBar(0,
+			mpb.BarStyle("|▇▇ |"),
+			mpb.PrependDecorators(
+				decor.Name(color.HiBlueString(table.TableName)),
+				decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
+			),
+			mpb.AppendDecorators(
+				decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", ", decor.WCSyncWidth),
+				decor.AverageSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", decor.WCSyncWidth),
+				decor.AverageETA(decor.ET_STYLE_MMSS),
+			),
+		)
+	}
 
+	for _, table := range tables {
 		// this makes sure we capture tableName in a way that it doesn't
 		// change on us within our loop
 		// And IMO this is cleaner than having the func below accept the string
-		tableName := tableName
+		tableName := table.TableName
+		bar := table.bar
+
+		// ensure we only run up to our max imports at a time
+		guard <- struct{}{}
+
 		wg.Add(1)
 
 		go func() {
@@ -362,20 +345,8 @@ func main() {
 				panic(err)
 			}
 
-			// our pretty bar config for the progress bars
-			// their documention lives over here https://github.com/vbauerster/mpb
-			bar := pb.AddBar(count.Count,
-				mpb.BarStyle("|▇▇ |"),
-				mpb.PrependDecorators(
-					decor.Name(color.HiBlueString(tableName)),
-					decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
-				),
-				mpb.AppendDecorators(
-					decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", ", decor.WCSyncWidth),
-					decor.AverageSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", decor.WCSyncWidth),
-					decor.AverageETA(decor.ET_STYLE_MMSS),
-				),
-			)
+			// update the bar count to the total now that we know it
+			bar.SetTotal(count.Count, false)
 
 			// now we get the table creation syntax from our source
 			var table struct {
@@ -502,4 +473,6 @@ func main() {
 	}
 
 	pb.Wait()
+
+	fmt.Println("finished importing", len(tables), english.PluralWord(len(tables), "table", ""), "in", time.Since(start))
 }
