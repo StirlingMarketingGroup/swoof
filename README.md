@@ -16,6 +16,7 @@ You will need Golang, which you can get from here https://golang.org/doc/install
 
 ## Installing
 
+All you need to download, build, and install is the following command (including the dots, Go's neat!)
 ```shell
 go get github.com/StirlingMarketingGroup/swoof/...
 ```
