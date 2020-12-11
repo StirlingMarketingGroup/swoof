@@ -121,7 +121,10 @@ func main() {
 	var wg sync.WaitGroup
 	pb := mpb.New(mpb.WithWaitGroup(&wg))
 
+	tableCount := 0
 	for table := range tables {
+		tableCount++
+
 		// this makes sure we capture tableName in a way that it doesn't
 		// change on us within our loop
 		// And IMO this is cleaner than having the func below accept the string
@@ -475,5 +478,5 @@ func main() {
 
 	pb.Wait()
 
-	fmt.Println("finished importing", len(tables), english.PluralWord(len(tables), "table", ""), "in", time.Since(start))
+	fmt.Println("finished importing", tableCount, english.PluralWord(tableCount, "table", ""), "in", time.Since(start))
 }
