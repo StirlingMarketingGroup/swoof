@@ -403,6 +403,11 @@ func main() {
 				panic(err)
 			}
 
+			err = dst.Exec("start transaction")
+			if err != nil {
+				panic(err)
+			}
+
 			if !*skipData {
 				// and if we aren't skipping the data, start the import!
 				// Now this *does* have to be chunked because there's no way to stream
@@ -415,6 +420,11 @@ func main() {
 				if err != nil {
 					panic(err)
 				}
+			}
+
+			err = dst.Exec("commit")
+			if err != nil {
+				panic(err)
 			}
 
 			// and just in case the rows have changed count since our count selection,
