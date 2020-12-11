@@ -153,16 +153,28 @@ func main() {
 				GenerationExpression string `mysql:"GENERATION_EXPRESSION"`
 			})
 
+			// we need to check to see if the db supports generated columns
+			// if it doesn't, our query to get column info will fail
+			columnInfoCols := "`COLUMN_NAME`,`ORDINAL_POSITION`,`DATA_TYPE`,`COLUMN_TYPE`"
+			ok, err := src.Exists("select 0 "+
+				"from`information_schema`.`columns`"+
+				"where`TABLE_SCHEMA`='INFORMATION_SCHEMA'"+
+				"and`table_name`='columns'"+
+				"and`column_name`='GENERATION_EXPRESSION'", 0)
+			if err != nil {
+				panic(err)
+			}
+			if ok {
+				columnInfoCols += ",`GENERATION_EXPRESSION`"
+			}
+
 			// in this query we're simply getting all the details about our column names
 			// so we can make a dynamic struct that the rows can fit into
-			err := src.Select(columns, "select`COLUMN_NAME`,`ORDINAL_POSITION`,`DATA_TYPE`,`COLUMN_TYPE`,"+
-				"`GENERATION_EXPRESSION`"+
-				"from`INFORMATION_SCHEMA`.columns "+
+			err = src.Select(columns, "select"+columnInfoCols+
+				"from`INFORMATION_SCHEMA`.`columns`"+
 				"where`TABLE_SCHEMA`=database()"+
-				"and table_name=@@TableName "+
-				"order by`ORDINAL_POSITION`", 0, mysql.Params{
-				"TableName": tableName,
-			})
+				"and`table_name`='"+tableName+"'"+
+				"order by`ORDINAL_POSITION`", 0)
 			if err != nil {
 				panic(err)
 			}
@@ -264,7 +276,7 @@ func main() {
 				case "float":
 					var v *float64
 					rowStruct.AddField(f, v, tag)
-				case "decimal":
+				case "decimal", "double":
 					// our cool mysql literal is exactly what it sounds like;
 					// passed directly into the query with no escaping, which is know is
 					// safe here because a decimal from mysql can't contain breaking characters
@@ -273,10 +285,10 @@ func main() {
 				case "timestamp", "date", "datetime":
 					var v *string
 					rowStruct.AddField(f, v, tag)
-				case "binary", "varbinary", "blob", "mediumblob":
+				case "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob":
 					var v *[]byte
 					rowStruct.AddField(f, v, tag)
-				case "char", "varchar", "text", "mediumtext":
+				case "char", "varchar", "text", "tinytext", "mediumtext", "longtext", "enum":
 					var v *string
 					rowStruct.AddField(f, v, tag)
 				case "json":
@@ -403,6 +415,11 @@ func main() {
 				panic(err)
 			}
 
+			// transactions are *much* faster than inserting the row blocks and committing in between
+			// even though we pay a small price at the commit to let the indexes build out.
+			// this is also faster (and easier to implement) then creating the table without
+			// indexes first and then adding them in later
+			// this also has a benefit of not blocking a cluster for writes like the alter would
 			err = dst.Exec("start transaction")
 			if err != nil {
 				panic(err)
