@@ -312,6 +312,15 @@ func main() {
 
 			columnsQuoted := columnsQuotedBld.String()
 
+			// oh yeah, that's just one query. We don't actually have to chunk this selection
+			// because we're dealing with rows as they come in, instead of tryign to select them
+			// all into memory or something first, which makes this code dramatically simpler
+			// and should work with tables of all sizes
+			err = src.Select(ch, "select"+columnsQuoted+"from`"+tableName+"`", 0)
+			if err != nil {
+				panic(err)
+			}
+
 			// we make the dest connection in the loop, once per table, because
 			// we need to be able to set foreign keys off, and the connection pooling
 			// by default makes this difficult. So instead we declare it here, and turn off
@@ -339,30 +348,6 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
-
-			// oh yeah, that's just one query. We don't actually have to chunk this selection
-			// because we're dealing with rows as they come in, instead of tryign to select them
-			// all into memory or something first, which makes this code dramatically simpler
-			// and should work with tables of all sizes
-			err = src.Select(ch, "select"+columnsQuoted+"from`"+tableName+"`", 0)
-			if err != nil {
-				panic(err)
-			}
-
-			// our pretty bar config for the progress bars
-			// their documention lives over here https://github.com/vbauerster/mpb
-			bar := pb.AddBar(count.Count,
-				mpb.BarStyle("|▇▇ |"),
-				mpb.PrependDecorators(
-					decor.Name(color.HiBlueString(tableName)),
-					decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
-				),
-				mpb.AppendDecorators(
-					decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", ", decor.WCSyncWidth),
-					decor.AverageSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", decor.WCSyncWidth),
-					decor.AverageETA(decor.ET_STYLE_MMSS),
-				),
-			)
 
 			// now we get the table creation syntax from our source
 			var table struct {
@@ -424,6 +409,21 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
+
+			// our pretty bar config for the progress bars
+			// their documention lives over here https://github.com/vbauerster/mpb
+			bar := pb.AddBar(count.Count,
+				mpb.BarStyle("|▇▇ |"),
+				mpb.PrependDecorators(
+					decor.Name(color.HiBlueString(tableName)),
+					decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
+				),
+				mpb.AppendDecorators(
+					decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", ", decor.WCSyncWidth),
+					decor.AverageSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", decor.WCSyncWidth),
+					decor.AverageETA(decor.ET_STYLE_MMSS),
+				),
+			)
 
 			if !*skipData {
 				// and if we aren't skipping the data, start the import!
