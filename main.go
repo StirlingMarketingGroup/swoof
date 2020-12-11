@@ -102,7 +102,7 @@ func main() {
 	// and now we can get our tables ordered by the largest physical tables first
 	// this *should* help performance, so that the longest table doesn't start last
 	// and draw out the total process time
-	// this also has the nice ideside effect of de-duplicating our tables list
+	// this also has the nice side effect of de-duplicating our tables list
 	tables := make(chan struct {
 		TableName string `mysql:"table_name"`
 	})
