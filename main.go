@@ -187,10 +187,6 @@ func main() {
 			// which will be used in our select statement
 			columnsQuotedBld := new(strings.Builder)
 
-			// and because our cool mysql insert functions needs a slice of
-			// column names, we'll need to keep track of those as we loop through them
-			columnNames := make([]string, 0)
-
 			// this slice will be our index of struct field names
 			// we aren't naming our struct properties with the actual column names
 			// because they can contain all sorts of weird characters,
@@ -210,8 +206,6 @@ func main() {
 				if len(c.GenerationExpression) != 0 {
 					continue
 				}
-
-				columnNames = append(columnNames, c.ColumnName)
 
 				// column string should be like "`Column1`,`Column2`..."
 				if i != 0 {
@@ -430,7 +424,7 @@ func main() {
 				// Now this *does* have to be chunked because there's no way to stream
 				// rows to mysql, but cool mysql handles this for us, all it needs is the same
 				// channel we got from the select
-				err = dst.InsertWithRowComplete("insert into`"+tempTableName+"`", columnNames, ch, func(start time.Time) {
+				err = dst.InsertWithRowComplete("insert into`"+tempTableName+"`", ch, func(start time.Time) {
 					bar.Increment()
 					bar.DecoratorEwmaUpdate(time.Since(start))
 				})
