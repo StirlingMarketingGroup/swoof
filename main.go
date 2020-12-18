@@ -230,6 +230,8 @@ func main() {
 				// cool mysql insert func knows how to map the row values
 				tag := `mysql:"` + c.ColumnName + `"`
 
+				var v interface{}
+
 				// the switch through data types (differnet than column types, doesn't include lengths)
 				// to determine the type of our struct field
 				// All of the field types are pointers so that our mysql scanning
@@ -237,64 +239,52 @@ func main() {
 				switch c.DataType {
 				case "tinyint":
 					if unsigned {
-						var v *uint8
-						rowStruct.AddField(f, v, tag)
+						v = new(uint8)
 					} else {
-						var v *int8
-						rowStruct.AddField(f, v, tag)
+						v = new(int8)
 					}
 				case "smallint":
 					if unsigned {
-						var v *uint16
-						rowStruct.AddField(f, v, tag)
+						v = new(uint16)
 					} else {
-						var v *int16
-						rowStruct.AddField(f, v, tag)
+						v = new(int16)
 					}
 				case "int", "mediumint":
 					if unsigned {
-						var v *uint32
-						rowStruct.AddField(f, v, tag)
+						v = new(uint32)
 					} else {
-						var v *int32
-						rowStruct.AddField(f, v, tag)
+						v = new(int32)
 					}
 				case "bigint":
 					if unsigned {
-						var v *uint64
-						rowStruct.AddField(f, v, tag)
+						v = new(uint64)
 					} else {
-						var v *int64
-						rowStruct.AddField(f, v, tag)
+						v = new(int64)
 					}
 				case "float":
-					var v *float64
-					rowStruct.AddField(f, v, tag)
+					v = new(float64)
 				case "decimal", "double":
 					// our cool mysql literal is exactly what it sounds like;
 					// passed directly into the query with no escaping, which is know is
 					// safe here because a decimal from mysql can't contain breaking characters
-					var v *mysql.Literal
-					rowStruct.AddField(f, v, tag)
+					v = new(mysql.Literal)
 				case "timestamp", "date", "datetime":
-					var v *string
-					rowStruct.AddField(f, v, tag)
+					v = new(string)
 				case "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob":
-					var v *[]byte
-					rowStruct.AddField(f, v, tag)
+					v = new([]byte)
 				case "char", "varchar", "text", "tinytext", "mediumtext", "longtext", "enum":
-					var v *string
-					rowStruct.AddField(f, v, tag)
+					v = new(string)
 				case "json":
 					// the json type here is important, because mysql needs
 					// char set info for json columns, since json is supposed to be utf8,
 					// and go treats this is bytes for some reason. mysql.JSON lets cool mysql
 					// know to surround the inlined value with charset info
-					var v *mysql.JSON
-					rowStruct.AddField(f, v, tag)
+					v = new(mysql.JSON)
 				default:
 					panic(errors.Errorf("unknown mysql column of type %q", c.ColumnType))
 				}
+
+				rowStruct.AddField(f, v, tag)
 
 				i++
 			}
