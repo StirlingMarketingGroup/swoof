@@ -38,6 +38,7 @@ swoof [flags] production localhost table1 table2 table3
 ### Flags:
 
   - `-c` your connections file (default `~/.config/swoof/connections.yaml` on Linux, more info below)
+  - `-disable-tx` disables transactions for inserts, this will dramatically slow down imports
   - `-n` drop/create tables and triggers only, without importing data
   - `-p` prefix of the temp table used for initial creation before the swap and drop (default `_swoof_`)
   - `-r` value
@@ -110,3 +111,13 @@ Default:       4194304
 Max packet size allowed in bytes. The default value is 4 MiB and should be adjusted to match the server settings. `maxAllowedPacket=0` can be used to automatically fetch the `max_allowed_packet` variable from server *on every connection*.
 
 You can read more about DSNs here https://github.com/go-sql-driver/mysql#dsn-data-source-name.
+
+### Limitations
+
+It's possible that you'll get the following error when importing a rather large table
+
+```
+panic: Error 1180: Got error 5 - 'Transaction size exceed set threshold' during COMMIT
+```
+
+To get around this, you can either increase your `innodb_log_file_size` in your MySQL server config to something like `256MB`, or you can use the command line flag `-disable-tx` to disable the use of transactions. This will make the copy go *much* slower, but slower is better than not working at all. Read more here [mysql innodb max size of transaction](https://stackoverflow.com/a/2724139/728236).

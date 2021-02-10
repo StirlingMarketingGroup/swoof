@@ -26,6 +26,8 @@ var (
 
 	connectionsFile = root.String("c", confDir+"/swoof/connections.yaml", "your connections file")
 
+	disableTransactions = root.Bool("disable-tx", false, "disables transactions for inserts, this will dramatically slow down imports")
+
 	skipData = root.Bool("n", false, "drop/create tables and triggers only, without importing data")
 
 	threads = root.Int("t", 4, "max concurrent tables at the same time, import stability may vary wildly between servers while increasing this")
@@ -384,14 +386,16 @@ func main() {
 				panic(err)
 			}
 
-			// transactions are *much* faster than inserting the row blocks and committing in between
-			// even though we pay a small price at the commit to let the indexes build out.
-			// this is also faster (and easier to implement) then creating the table without
-			// indexes first and then adding them in later
-			// this also has a benefit of not blocking a cluster for writes like the alter would
-			err = dst.Exec("start transaction")
-			if err != nil {
-				panic(err)
+			if !*disableTransactions {
+				// transactions are *much* faster than inserting the row blocks and committing in between
+				// even though we pay a small price at the commit to let the indexes build out.
+				// this is also faster (and easier to implement) then creating the table without
+				// indexes first and then adding them in later
+				// this also has a benefit of not blocking a cluster for writes like the alter would
+				err = dst.Exec("start transaction")
+				if err != nil {
+					panic(err)
+				}
 			}
 
 			// our pretty bar config for the progress bars
@@ -423,9 +427,11 @@ func main() {
 				}
 			}
 
-			err = dst.Exec("commit")
-			if err != nil {
-				panic(err)
+			if !*disableTransactions {
+				err = dst.Exec("commit")
+				if err != nil {
+					panic(err)
+				}
 			}
 
 			// and just in case the rows have changed count since our count selection,
