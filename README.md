@@ -38,6 +38,7 @@ swoof [flags] production localhost table1 table2 table3
 ### Flags:
 
   - `-c` your connections file (default `~/.config/swoof/connections.yaml` on Linux, more info below)
+  - `-a` your alises file (default `~/.config/swoof/aliases.yaml` on Linux, more info below)
   - `-disable-tx` disables transactions for inserts, this will dramatically slow down imports
   - `-n` drop/create tables and triggers only, without importing data
   - `-p` prefix of the temp table used for initial creation before the swap and drop (default `_swoof_`)
@@ -74,6 +75,34 @@ This file is located using Golangs `os.UserConfigDir()`.
 > On Unix systems, it returns $XDG_CONFIG_HOME as specified by <https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html> if non-empty, else $HOME/.config. On Darwin, it returns $HOME/Library/Application Support. On Windows, it returns %AppData%. On Plan 9, it returns $home/lib.
 
 If you run `swoof` with no arguments, it will list the default on your system under the flag descriptions. You can specify your own location with the `-c` flag.
+
+### Using an aliases files
+
+You can use a `aliases.yaml` file that looks like this to describe sets of tables
+
+```yaml
+Products:
+  - products
+  - productlines
+Orders:
+  - orders
+  - orderdetails
+  - products
+  - productlines
+  - customers
+  - payments
+All:
+  - productlines
+  - products
+  - orderdetails
+  - orders
+  - customers
+  - payments
+  - employees
+  - offices
+```
+
+the cli works just as usual. The program checks if the key passed is one of the keys in the aliases file and then checks if its a table. So make sure that your aliases do not match your tabkle names!
 
 ### DSN (Data Source Name)
 

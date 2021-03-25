@@ -10,7 +10,7 @@ import (
 	"time"
 
 	dynamicstruct "github.com/Ompluscator/dynamic-struct"
-	mysql "github.com/StirlingMarketingGroup/cool-mysql"
+	cool "github.com/StirlingMarketingGroup/cool-mysql"
 	"github.com/dustin/go-humanize/english"
 	"github.com/fatih/color"
 	"github.com/pkg/errors"
@@ -23,6 +23,8 @@ var confDir, _ = os.UserConfigDir()
 
 var (
 	root = cmd.New()
+
+	aliasesFiles = root.String("a", confDir+"/swoof/aliases.yaml", "your alaises file")
 
 	connectionsFile = root.String("c", confDir+"/swoof/connections.yaml", "your connections file")
 
@@ -86,19 +88,40 @@ func main() {
 
 	// source connection is the first argument
 	// this is where our rows are coming from
-	src, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
+	src, err := cool.NewFromDSN(sourceDSN, sourceDSN)
 	if err != nil {
 		panic(err)
 	}
 
-	// loop though the tables we were given and make sure they
+	aliases, err := getTables(*aliasesFiles)
+	var tableNames []string
+	var foundAlias bool
+	// loop though the aliases/tables we were given and make sure they
 	// all exist, throw errors for ones that don't before we start
 	for _, t := range (*args)[2:] {
-		if ok, err := src.Exists("show tables like'"+t+"'", 0); err != nil {
-			panic(err)
-		} else if !ok {
-			panic(errors.Errorf("table %q does not exist on the source connection", t))
+		// if we have an aliases config
+		// we check if the passed argument
+		// is a key in the alises file
+		if err == nil {
+			if alias, ok := aliases[t]; ok {
+				// the passed argument was an alias so we
+				// append all of the tables under that argument
+				// and set foundAlias to true to not try and find
+				// the table with the alias provided
+				foundAlias = true
+				for _, a := range alias {
+					appendTable(src, a, &tableNames)
+				}
+			}
 		}
+
+		// if there was no alias config file or
+		// the passed variable was not in the
+		// aliases file we treat it as a normal table
+		if err != nil || !foundAlias {
+			appendTable(src, t, &tableNames)
+		}
+		foundAlias = false
 	}
 
 	// and now we can get our tables ordered by the largest physical tables first
@@ -112,8 +135,8 @@ func main() {
 		"from`information_schema`.`TABLES`"+
 		"where`table_schema`=database()"+
 		"and`table_name`in(@@Tables)"+
-		"order by`data_length`+`index_length`desc", 0, mysql.Params{
-		"Tables": (*args)[2:],
+		"order by`data_length`+`index_length`desc", 0, cool.Params{
+		"Tables": tableNames,
 	})
 	if err != nil {
 		panic(err)
@@ -269,7 +292,7 @@ func main() {
 					// our cool mysql literal is exactly what it sounds like;
 					// passed directly into the query with no escaping, which is know is
 					// safe here because a decimal from mysql can't contain breaking characters
-					v = new(mysql.Literal)
+					v = new(cool.Literal)
 				case "timestamp", "date", "datetime":
 					v = new(string)
 				case "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob":
@@ -281,7 +304,7 @@ func main() {
 					// char set info for json columns, since json is supposed to be utf8,
 					// and go treats this is bytes for some reason. mysql.JSON lets cool mysql
 					// know to surround the inlined value with charset info
-					v = new(mysql.JSON)
+					v = new(cool.JSON)
 				default:
 					panic(errors.Errorf("unknown mysql column of type %q", c.ColumnType))
 				}
@@ -311,7 +334,7 @@ func main() {
 			// we need to be able to set foreign keys off, and the connection pooling
 			// by default makes this difficult. So instead we declare it here, and turn off
 			// pooling, almost creating our own "pool"
-			dst, err := mysql.NewFromDSN(destDSN, destDSN)
+			dst, err := cool.NewFromDSN(destDSN, destDSN)
 			if err != nil {
 				panic(err)
 			}

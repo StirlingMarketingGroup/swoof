@@ -1,0 +1,19 @@
+Products:
+  - products
+  - productlines
+Orders:
+  - orders
+  - orderdetails
+  - products
+  - productlines
+  - customers
+  - payments
+All:
+  - productlines
+  - products
+  - orderdetails
+  - orders
+  - customers
+  - payments
+  - employees
+  - offices

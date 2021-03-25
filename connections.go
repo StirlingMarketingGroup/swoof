@@ -4,7 +4,9 @@ import (
 	"io/ioutil"
 	"net/url"
 
+	cool "github.com/StirlingMarketingGroup/cool-mysql"
 	"github.com/go-sql-driver/mysql"
+	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 )
 
@@ -59,4 +61,15 @@ func connectionToDSN(c connection) string {
 	}
 
 	return dsn
+}
+
+// checkIfInSource is a wrapper function that checks if the
+// the table for a given connection exists and panics if
+// if there is no table in that connection
+func checkIfInSource(s *cool.Database, t string) {
+	if ok, err := s.Exists("show tables like'"+t+"'", 0); err != nil {
+		panic(err)
+	} else if !ok {
+		panic(errors.Errorf("table %q does not exist on the source connection", t))
+	}
 }
