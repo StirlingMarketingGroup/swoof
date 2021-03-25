@@ -95,33 +95,16 @@ func main() {
 
 	aliases, err := getTables(*aliasesFiles)
 	var tableNames []string
-	var foundAlias bool
 	// loop though the aliases/tables we were given and make sure they
 	// all exist, throw errors for ones that don't before we start
 	for _, t := range (*args)[2:] {
-		// if we have an aliases config
-		// we check if the passed argument
-		// is a key in the alises file
-		if err == nil {
-			if alias, ok := aliases[t]; ok {
-				// the passed argument was an alias so we
-				// append all of the tables under that argument
-				// and set foundAlias to true to not try and find
-				// the table with the alias provided
-				foundAlias = true
-				for _, a := range alias {
-					appendTable(src, a, &tableNames)
-				}
+		if alias, ok := aliases[t]; ok {
+			for _, a := range alias {
+				appendTable(src, a, &tableNames)
 			}
-		}
-
-		// if there was no alias config file or
-		// the passed variable was not in the
-		// aliases file we treat it as a normal table
-		if err != nil || !foundAlias {
+		} else {
 			appendTable(src, t, &tableNames)
 		}
-		foundAlias = false
 	}
 
 	// and now we can get our tables ordered by the largest physical tables first
