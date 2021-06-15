@@ -9,11 +9,6 @@ Orders:
   - customers
   - payments
 All:
-  - productlines
-  - products
-  - orderdetails
-  - orders
-  - customers
-  - payments
-  - employees
-  - offices
+  - Products
+  - Orders
+  - users
