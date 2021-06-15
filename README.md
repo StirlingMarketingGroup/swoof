@@ -92,17 +92,13 @@ Orders:
   - customers
   - payments
 All:
-  - productlines
-  - products
-  - orderdetails
-  - orders
-  - customers
-  - payments
-  - employees
-  - offices
+  - Products
+  - Orders
 ```
 
-the cli works just as usual. The program checks if the key passed is one of the keys in the aliases file and then checks if its a table. So make sure that your aliases do not match your tabkle names!
+the cli works just as usual. The program checks if the key passed is one of the keys in the aliases file and then checks if its a table. So make sure that your aliases do not match your table names!
+
+Also, Aliases can use other aliases which resolve until all of the aliases become just the table names.
 
 ### DSN (Data Source Name)
 
