@@ -93,18 +93,9 @@ func main() {
 		panic(err)
 	}
 
-	aliases, err := getTables(*aliasesFiles)
-	var tableNames []string
-	// loop though the aliases/tables we were given and make sure they
-	// all exist, throw errors for ones that don't before we start
-	for _, t := range (*args)[2:] {
-		if alias, ok := aliases[t]; ok {
-			for _, a := range alias {
-				appendTable(src, a, &tableNames)
-			}
-		} else {
-			appendTable(src, t, &tableNames)
-		}
+	tableNames, err := getTables(*aliasesFiles, args, src)
+	if err != nil {
+		panic(err)
 	}
 
 	// and now we can get our tables ordered by the largest physical tables first
@@ -119,7 +110,7 @@ func main() {
 		"where`table_schema`=database()"+
 		"and`table_name`in(@@Tables)"+
 		"order by`data_length`+`index_length`desc", 0, cool.Params{
-		"Tables": tableNames,
+		"Tables": *tableNames,
 	})
 	if err != nil {
 		panic(err)

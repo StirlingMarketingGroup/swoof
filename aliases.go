@@ -3,13 +3,15 @@ package main
 import (
 	"io/ioutil"
 
+	cool "github.com/StirlingMarketingGroup/cool-mysql"
 	"gopkg.in/yaml.v2"
 )
 
 // getTables returns a map of tables
 // that can be checked for groups of tables
 // set by the configuation
-func getTables(file string) (tables map[string][]string, err error) {
+func getTables(file string, args *[]string, src *cool.Database) (*[]string, error) {
+	var tables map[string][]string
 	y, err := ioutil.ReadFile(file)
 	if err != nil {
 		return nil, err
@@ -19,5 +21,18 @@ func getTables(file string) (tables map[string][]string, err error) {
 		return nil, err
 	}
 
-	return
+	var tableNames []string
+	checkTables(src, (*args)[2:], tables, &tableNames)
+
+	return &tableNames, nil
+}
+
+func checkTables(src *cool.Database, tableList []string, aliases map[string][]string, tableNames *[]string) {
+	for _, t := range tableList {
+		if alias, ok := aliases[t]; ok {
+			checkTables(src, alias, aliases, tableNames)
+		} else {
+			appendTable(src, t, tableNames)
+		}
+	}
 }
