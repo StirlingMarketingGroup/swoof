@@ -279,6 +279,8 @@ func main() {
 					// and go treats this is bytes for some reason. mysql.JSON lets cool mysql
 					// know to surround the inlined value with charset info
 					v = new(cool.JSON)
+				case "set":
+					v = new(any)
 				default:
 					panic(errors.Errorf("unknown mysql column of type %q", c.ColumnType))
 				}
