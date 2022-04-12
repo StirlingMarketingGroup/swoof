@@ -301,7 +301,7 @@ func main() {
 			// because we're dealing with rows as they come in, instead of tryign to select them
 			// all into memory or something first, which makes this code dramatically simpler
 			// and should work with tables of all sizes
-			err = src.Select(ch, "select"+columnsQuoted+"from`"+tableName+"`", 0)
+			err = src.Select(ch, "select /*+ MAX_EXECUTION_TIME(2147483647) */ "+columnsQuoted+"from`"+tableName+"`", 0)
 			if err != nil {
 				panic(err)
 			}
