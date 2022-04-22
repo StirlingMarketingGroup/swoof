@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io/ioutil"
 
 	cool "github.com/StirlingMarketingGroup/cool-mysql"
@@ -14,11 +15,12 @@ func getTables(file string, args *[]string, src *cool.Database) (*[]string, erro
 	var tables map[string][]string
 	y, err := ioutil.ReadFile(file)
 	if err != nil {
-		return nil, err
-	}
-	err = yaml.Unmarshal(y, &tables)
-	if err != nil {
-		return nil, err
+		fmt.Printf("failed to read aliases file\ndefault location for config is %s/swoof/connections.yaml\n", confDir)
+	} else {
+		err = yaml.Unmarshal(y, &tables)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var tableNames []string
