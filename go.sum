@@ -6,6 +6,8 @@ github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20220428143112-2c07ccb2cf3a 
 github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20220428143112-2c07ccb2cf3a/go.mod h1:V8eK9k9CQb9/6B4m+v/J8pMZlBqfDDt1FFba5kIzjf4=
 github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20220701174542-3458c79995f0 h1:Kage4d7b0NFMvJU/97mBLzX9WP81DeYAI/4lDn688lw=
 github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20220701174542-3458c79995f0/go.mod h1:sb5EvI/Y1R3ml4wpUpfUWUe0P0SGMIyJGXbU2sJi7fc=
+github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20220715143212-5b2b1a10e6e7 h1:wWpTwHP4sel6UfdbCY6OQxofBwAATWudvU3surXasKk=
+github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20220715143212-5b2b1a10e6e7/go.mod h1:sb5EvI/Y1R3ml4wpUpfUWUe0P0SGMIyJGXbU2sJi7fc=
 github.com/VividCortex/ewma v1.1.1/go.mod h1:2Tkkvm3sRDVXaiyucHiACn4cqf7DpdyLvmxzcbUokwA=
 github.com/VividCortex/ewma v1.2.0 h1:f58SaIzcDXrSy3kWaHNvuJgJ3Nmz59Zji6XoJR/q1ow=
 github.com/VividCortex/ewma v1.2.0/go.mod h1:nz4BbCtbLyFDeC9SUHbtcT5644juEuWfUAUnGx7j5l4=

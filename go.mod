@@ -4,7 +4,7 @@ go 1.18
 
 require (
 	github.com/Ompluscator/dynamic-struct v1.3.0
-	github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20220701174542-3458c79995f0
+	github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20220715143212-5b2b1a10e6e7
 	github.com/dustin/go-humanize v1.0.0
 	github.com/fatih/color v1.13.0
 	github.com/go-sql-driver/mysql v1.6.0
