@@ -329,7 +329,7 @@ func main() {
 			} else {
 				dst, err = dstDB.BeginTx(context.Background())
 				if err != nil {
-					panic(fmt.Errorf("failed to being transaction: %w", err))
+					panic(fmt.Errorf("failed to begin transaction: %w", err))
 				}
 			}
 
