@@ -94,6 +94,8 @@ func main() {
 		panic(err)
 	}
 
+	src.DisableUnusedColumnWarnings = true
+
 	tableNames, err := getTables(*aliasesFiles, args, src)
 	if err != nil {
 		panic(err)
@@ -106,16 +108,19 @@ func main() {
 	tables := make(chan struct {
 		TableName string `mysql:"table_name"`
 	})
-	err = src.Select(tables, "select`table_name`"+
-		"from`information_schema`.`TABLES`"+
-		"where`table_schema`=database()"+
-		"and`table_name`in(@@Tables)"+
-		"order by`data_length`+`index_length`desc", 0, cool.Params{
-		"Tables": *tableNames,
-	})
-	if err != nil {
-		panic(err)
-	}
+	go func() {
+		defer close(tables)
+		err = src.Select(tables, "select`table_name`"+
+			"from`information_schema`.`TABLES`"+
+			"where`table_schema`=database()"+
+			"and`table_name`in(@@Tables)"+
+			"order by`data_length`+`index_length`desc", 0, cool.Params{
+			"Tables": *tableNames,
+		})
+		if err != nil {
+			panic(err)
+		}
+	}()
 
 	// our multi-progress bar ties right into our wait group
 	var wg sync.WaitGroup
@@ -170,14 +175,17 @@ func main() {
 
 			// in this query we're simply getting all the details about our column names
 			// so we can make a dynamic struct that the rows can fit into
-			err = src.Select(columns, "select"+columnInfoCols+
-				"from`INFORMATION_SCHEMA`.`columns`"+
-				"where`TABLE_SCHEMA`=database()"+
-				"and`table_name`='"+tableName+"'"+
-				"order by`ORDINAL_POSITION`", 0)
-			if err != nil {
-				panic(err)
-			}
+			go func() {
+				defer close(columns)
+				err = src.Select(columns, "select"+columnInfoCols+
+					"from`INFORMATION_SCHEMA`.`columns`"+
+					"where`TABLE_SCHEMA`=database()"+
+					"and`table_name`='"+tableName+"'"+
+					"order by`ORDINAL_POSITION`", 0)
+				if err != nil {
+					panic(err)
+				}
+			}()
 
 			// this is our dynamic struct of the actual row, which will have
 			// properties added to it for each column in the following loop
@@ -186,13 +194,6 @@ func main() {
 			// this is our string builder for quoted column names,
 			// which will be used in our select statement
 			columnsQuotedBld := new(strings.Builder)
-
-			// this slice will be our index of struct field names
-			// we aren't naming our struct properties with the actual column names
-			// because they can contain all sorts of weird characters,
-			// and we also need uppercase starting letters so the other libraries
-			// like cool mysql can actually access them
-			colStructFields := make([]string, 0)
 
 			i := 0
 
@@ -221,10 +222,6 @@ func main() {
 
 				// these are our struct fields, which all look like "F0", "F1", etc
 				f := "F" + strconv.Itoa(c.Position)
-				// and we have to keep track of their order because dynamic struct uses
-				// a map internally and these fields will be in random orders once we
-				// build the struct
-				colStructFields = append(colStructFields, f)
 
 				// create the tag for the field with the exact column name so that
 				// cool mysql insert func knows how to map the row values
@@ -294,18 +291,23 @@ func main() {
 			// this gets the "type" of our struct from our dynamic struct
 			structType := reflect.Indirect(reflect.ValueOf(rowStruct.Build().New())).Type()
 			// and then we make a channel with reflection for our new type of struct
-			ch := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize).Interface()
+			chRef := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize)
+			ch := chRef.Interface()
 
 			columnsQuoted := columnsQuotedBld.String()
 
 			// oh yeah, that's just one query. We don't actually have to chunk this selection
-			// because we're dealing with rows as they come in, instead of tryign to select them
+			// because we're dealing with rows as they come in, instead of trying to select them
 			// all into memory or something first, which makes this code dramatically simpler
 			// and should work with tables of all sizes
-			err = src.Select(ch, "select /*+ MAX_EXECUTION_TIME(2147483647) */ "+columnsQuoted+"from`"+tableName+"`", 0)
-			if err != nil {
-				panic(err)
-			}
+			go func() {
+				defer chRef.Close()
+
+				err = src.Select(ch, "select /*+ MAX_EXECUTION_TIME(2147483647) */ "+columnsQuoted+"from`"+tableName+"`", 0)
+				if err != nil {
+					panic(err)
+				}
+			}()
 
 			// we make the dest connection in the loop, once per table, because
 			// we need to be able to set foreign keys off, and the connection pooling
@@ -315,6 +317,8 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
+
+			src.DisableUnusedColumnWarnings = true
 
 			type Executor interface {
 				Exec(query string, params ...cool.Params) error
@@ -468,10 +472,13 @@ func main() {
 			triggers := make(chan struct {
 				Trigger string
 			})
-			err = src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0)
-			if err != nil {
-				panic(err)
-			}
+			go func() {
+				defer close(triggers)
+				err = src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0)
+				if err != nil {
+					panic(err)
+				}
+			}()
 			for r := range triggers {
 				var trigger struct {
 					CreateMySQL string `mysql:"SQL Original Statement"`
