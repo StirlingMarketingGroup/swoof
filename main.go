@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"reflect"
@@ -310,12 +311,27 @@ func main() {
 			// we need to be able to set foreign keys off, and the connection pooling
 			// by default makes this difficult. So instead we declare it here, and turn off
 			// pooling, almost creating our own "pool"
-			dst, err := cool.NewFromDSN(destDSN, destDSN)
+			dstDB, err := cool.NewFromDSN(destDSN, destDSN)
 			if err != nil {
 				panic(err)
 			}
-			// disables the pooling
-			dst.Writes.SetMaxOpenConns(1)
+
+			type Executor interface {
+				Exec(query string, params ...cool.Params) error
+				I() *cool.Inserter
+			}
+
+			// use a transaction for all the dst commands, if tx is not disabled
+			// NOTE: if tx is disabled, then you will almost for sure get foreign key errors
+			var dst Executor
+			if *disableTransactions {
+				dst = dstDB
+			} else {
+				dst, err = dstDB.BeginTx(context.Background())
+				if err != nil {
+					panic(fmt.Errorf("failed to begin transaction: %w", err))
+				}
+			}
 
 			// we need to disable this because importing two tables at the same time
 			// will almost certainly run into problems otherwise. Also dropping the table
@@ -385,18 +401,6 @@ func main() {
 				panic(err)
 			}
 
-			if !*disableTransactions {
-				// transactions are *much* faster than inserting the row blocks and committing in between
-				// even though we pay a small price at the commit to let the indexes build out.
-				// this is also faster (and easier to implement) then creating the table without
-				// indexes first and then adding them in later
-				// this also has a benefit of not blocking a cluster for writes like the alter would
-				err = dst.Exec("start transaction")
-				if err != nil {
-					panic(err)
-				}
-			}
-
 			// our pretty bar config for the progress bars
 			// their documention lives over here https://github.com/vbauerster/mpb
 			bar := pb.AddBar(count.Count,
@@ -421,13 +425,6 @@ func main() {
 					bar.Increment()
 					bar.DecoratorEwmaUpdate(time.Since(start))
 				}).Insert("insert into`"+tempTableName+"`", ch)
-				if err != nil {
-					panic(err)
-				}
-			}
-
-			if !*disableTransactions {
-				err = dst.Exec("commit")
 				if err != nil {
 					panic(err)
 				}
@@ -487,6 +484,13 @@ func main() {
 				err = dst.Exec(trigger.CreateMySQL)
 				if err != nil {
 					panic(err)
+				}
+			}
+
+			if tx, ok := dst.(*cool.Tx); ok {
+				err = tx.Commit()
+				if err != nil {
+					panic(fmt.Errorf("failed to commit transaction: %w", err))
 				}
 			}
 		}()
