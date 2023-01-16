@@ -1,7 +1,7 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
@@ -11,7 +11,7 @@ import (
 	"time"
 
 	dynamicstruct "github.com/Ompluscator/dynamic-struct"
-	cool "github.com/StirlingMarketingGroup/cool-mysql"
+	mysql "github.com/StirlingMarketingGroup/cool-mysql"
 	"github.com/dustin/go-humanize/english"
 	"github.com/fatih/color"
 	"github.com/pkg/errors"
@@ -89,7 +89,7 @@ func main() {
 
 	// source connection is the first argument
 	// this is where our rows are coming from
-	src, err := cool.NewFromDSN(sourceDSN, sourceDSN)
+	src, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
 	if err != nil {
 		panic(err)
 	}
@@ -114,7 +114,7 @@ func main() {
 			"from`information_schema`.`TABLES`"+
 			"where`table_schema`=database()"+
 			"and`table_name`in(@@Tables)"+
-			"order by`data_length`+`index_length`desc", 0, cool.Params{
+			"order by`data_length`+`index_length`desc", 0, mysql.Params{
 			"Tables": *tableNames,
 		})
 		if err != nil {
@@ -264,7 +264,7 @@ func main() {
 					// our cool mysql literal is exactly what it sounds like;
 					// passed directly into the query with no escaping, which is know is
 					// safe here because a decimal from mysql can't contain breaking characters
-					v = new(cool.Literal)
+					v = new(mysql.Raw)
 				case "timestamp", "date", "datetime":
 					v = new(string)
 				case "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob":
@@ -276,7 +276,7 @@ func main() {
 					// char set info for json columns, since json is supposed to be utf8,
 					// and go treats this is bytes for some reason. mysql.JSON lets cool mysql
 					// know to surround the inlined value with charset info
-					v = new(cool.JSON)
+					v = new(json.RawMessage)
 				case "set":
 					v = new(any)
 				default:
@@ -313,7 +313,7 @@ func main() {
 			// we need to be able to set foreign keys off, and the connection pooling
 			// by default makes this difficult. So instead we declare it here, and turn off
 			// pooling, almost creating our own "pool"
-			dstDB, err := cool.NewFromDSN(destDSN, destDSN)
+			dstDB, err := mysql.NewFromDSN(destDSN, destDSN)
 			if err != nil {
 				panic(err)
 			}
@@ -321,17 +321,19 @@ func main() {
 			src.DisableUnusedColumnWarnings = true
 
 			type Executor interface {
-				Exec(query string, params ...cool.Params) error
-				I() *cool.Inserter
+				Exec(query string, params ...any) error
+				I() *mysql.Inserter
 			}
 
 			// use a transaction for all the dst commands, if tx is not disabled
 			// NOTE: if tx is disabled, then you will almost for sure get foreign key errors
 			var dst Executor
+			var cancel func() error
 			if *disableTransactions {
 				dst = dstDB
 			} else {
-				dst, err = dstDB.BeginTx(context.Background())
+				dst, cancel, err = dstDB.BeginTx()
+				defer cancel()
 				if err != nil {
 					panic(fmt.Errorf("failed to begin transaction: %w", err))
 				}
@@ -345,13 +347,15 @@ func main() {
 				panic(err)
 			}
 
-			// and get the count, so we can show are swick progress bars
 			var count struct {
 				Count int64
 			}
-			err = src.Select(&count, "select count(*)`Count`from`"+tableName+"`", 0)
-			if err != nil {
-				panic(err)
+			if !*skipData {
+				// and get the count, so we can show are swick progress bars
+				err = src.Select(&count, "select count(*)`Count`from`"+tableName+"`", 0)
+				if err != nil {
+					panic(err)
+				}
 			}
 
 			// now we get the table creation syntax from our source
@@ -494,7 +498,7 @@ func main() {
 				}
 			}
 
-			if tx, ok := dst.(*cool.Tx); ok {
+			if tx, ok := dst.(*mysql.Tx); ok {
 				err = tx.Commit()
 				if err != nil {
 					panic(fmt.Errorf("failed to commit transaction: %w", err))
