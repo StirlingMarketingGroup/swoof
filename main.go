@@ -217,7 +217,7 @@ func main() {
 			// so we can make a dynamic struct that the rows can fit into
 			go func() {
 				defer close(columns)
-				err = src.Select(columns, "select"+columnInfoCols+
+				err := src.Select(columns, "select"+columnInfoCols+
 					"from`INFORMATION_SCHEMA`.`columns`"+
 					"where`TABLE_SCHEMA`=database()"+
 					"and`table_name`='"+tableName+"'"+
@@ -265,7 +265,7 @@ func main() {
 
 				// create the tag for the field with the exact column name so that
 				// cool mysql insert func knows how to map the row values
-				tag := `mysql:"` + c.ColumnName + `"`
+				tag := `mysql:"` + strings.ReplaceAll(c.ColumnName, `,`, `0x2C`) + `"`
 
 				var v interface{}
 
@@ -343,7 +343,7 @@ func main() {
 			go func() {
 				defer chRef.Close()
 
-				err = src.Select(ch, "select /*+ MAX_EXECUTION_TIME(2147483647) */ "+columnsQuoted+"from`"+tableName+"`", 0)
+				err := src.Select(ch, "select /*+ MAX_EXECUTION_TIME(2147483647) */ "+columnsQuoted+"from`"+tableName+"`", 0)
 				if err != nil {
 					panic(err)
 				}

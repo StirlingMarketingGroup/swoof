@@ -2,6 +2,8 @@ github.com/Ompluscator/dynamic-struct v1.3.0 h1:Ozvw+T2UOmV/2J2/L7tPZxrypKen3CGS
 github.com/Ompluscator/dynamic-struct v1.3.0/go.mod h1:01g22H1GC9IFcrpQ4JQBkzynp8RoT0wmUMx/OvXNnw8=
 github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20230810202258-d69b2dfdc4ce h1:35Yl4F9G8nWOvJyyvcZ5bRY5pRaiCorO5iDOtgFqUEc=
 github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20230810202258-d69b2dfdc4ce/go.mod h1:R7Opcse1jn6qvJDuSM6ph4shxnhaaYinxd9a1cttaX0=
+github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20230818185952-6ebe133fb106 h1:5wuMN0XBRn/tAHEkCMhbwEXWnqqbp1VNumWpiKHFlIc=
+github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20230818185952-6ebe133fb106/go.mod h1:R7Opcse1jn6qvJDuSM6ph4shxnhaaYinxd9a1cttaX0=
 github.com/VividCortex/ewma v1.1.1/go.mod h1:2Tkkvm3sRDVXaiyucHiACn4cqf7DpdyLvmxzcbUokwA=
 github.com/VividCortex/ewma v1.2.0 h1:f58SaIzcDXrSy3kWaHNvuJgJ3Nmz59Zji6XoJR/q1ow=
 github.com/VividCortex/ewma v1.2.0/go.mod h1:nz4BbCtbLyFDeC9SUHbtcT5644juEuWfUAUnGx7j5l4=
