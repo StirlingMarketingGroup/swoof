@@ -12,11 +12,12 @@ Also, `swoof` doesn't import tables over top of existing tables like `mysqldump`
 
 ## Dependencies
 
-You will need Golang, which you can get from here https://golang.org/doc/install.
+You will need Golang, which you can get from here <https://golang.org/doc/install>.
 
 ## Installing
 
 All you need to download, build, and install is the following command (including the dots, Go's neat!)
+
 ```shell
 go install github.com/StirlingMarketingGroup/swoof@master
 ```
@@ -35,17 +36,19 @@ swoof [flags] 'user:pass@(host)/dbname' 'user:pass@(host)/dbname' table1 table2 
 # or, with a connections file
 swoof [flags] production localhost table1 table2 table3
 ```
-### Flags:
 
-  - `-c` your connections file (default `~/.config/swoof/connections.yaml` on Linux, more info below)
-  - `-a` your alises file (default `~/.config/swoof/aliases.yaml` on Linux, more info below)
-  - `-disable-tx` disables transactions for inserts, this will dramatically slow down imports
-  - `-n` drop/create tables and triggers only, without importing data
-  - `-p` prefix of the temp table used for initial creation before the swap and drop (default `_swoof_`)
-  - `-r` value
-        max rows buffer size. Will have this many rows downloaded and ready for importing, or in Go terms, the channel size used to communicate the rows (default 50)
-  - `-t` value
-        max concurrent tables at the same time. Anything more than 4 seems to crash things, so YMMV (default 4)
+### Flags
+
+- `-c` your connections file (default `~/.config/swoof/connections.yaml` on Linux, more info below)
+- `-a` your alises file (default `~/.config/swoof/aliases.yaml` on Linux, more info below)
+- `-all` grabs all tables, specified tables/aliases are ignored (default false)
+- `-n` drop/create tables and triggers only, without importing data
+- `-p` prefix of the temp table used for initial creation before the swap and drop (default `_swoof_`)
+- `-r` value
+    max rows buffer size. Will have this many rows downloaded and ready for importing, or in Go terms, the channel size used to communicate the rows (default 50)
+- `-t` value
+    max concurrent tables at the same time. Anything more than 4 seems to crash things, so YMMV (default 4)
+- `-v` writes all queries to stdout (default false)
 
 ### Using a connections file
 
@@ -103,46 +106,43 @@ Also, Aliases can use other aliases which resolve until all of the aliases becom
 ### DSN (Data Source Name)
 
 Source and destination strings can also be DSNs. The Data Source Name has a common format, like e.g. [PEAR DB](http://pear.php.net/manual/en/package.database.db.intro-dsn.php) uses it, but without type-prefix (optional parts marked by squared brackets):
-```
+
+```shell
 [username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]
 ```
 
 A DSN in its fullest form:
-```
+
+```shell
 username:password@protocol(address)/dbname?param=value
 ```
 
 Except for the databasename, all values are optional. So the minimal DSN is:
-```
+
+```shell
 /dbname
 ```
 
 If you do not want to preselect a database, leave `dbname` empty:
-```
+
+```shell
 /
 ```
+
 This has the same effect as an empty DSN string:
-```
+
+```shell
 ```
 
 Using the DSN you can also tweak the packet size that's used. If you're running into deadlock issues or other issues, you can try to tune the packet size down by setting the packet size in the DSN like so.
 
-##### `maxAllowedPacket`
-```
+#### `maxAllowedPacket`
+
+```shell
 Type:          decimal number
 Default:       4194304
 ```
 
 Max packet size allowed in bytes. The default value is 4 MiB and should be adjusted to match the server settings. `maxAllowedPacket=0` can be used to automatically fetch the `max_allowed_packet` variable from server *on every connection*.
 
-You can read more about DSNs here https://github.com/go-sql-driver/mysql#dsn-data-source-name.
-
-### Limitations
-
-It's possible that you'll get the following error when importing a rather large table
-
-```
-panic: Error 1180: Got error 5 - 'Transaction size exceed set threshold' during COMMIT
-```
-
-To get around this, you can either increase your `innodb_log_file_size` in your MySQL server config to something like `256MB`, or you can use the command line flag `-disable-tx` to disable the use of transactions. This will make the copy go *much* slower, but slower is better than not working at all. Read more here [mysql innodb max size of transaction](https://stackoverflow.com/a/2724139/728236).
+You can read more about DSNs here <https://github.com/go-sql-driver/mysql#dsn-data-source-name>.

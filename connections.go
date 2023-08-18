@@ -1,11 +1,11 @@
 package main
 
 import (
-	"io/ioutil"
 	"net/url"
+	"os"
 
-	cool "github.com/StirlingMarketingGroup/cool-mysql"
-	"github.com/go-sql-driver/mysql"
+	mysql "github.com/StirlingMarketingGroup/cool-mysql"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 )
@@ -26,7 +26,7 @@ type connection struct {
 // makes calls to swoof much shorter and much easier
 // and even a little safer potentially
 func getConnections(file string) (connections map[string]connection, err error) {
-	y, err := ioutil.ReadFile(file)
+	y, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +41,7 @@ func getConnections(file string) (connections map[string]connection, err error) 
 // connectionToDSN converts our own connection structs to the
 // official mysql's own connection struct, formatted for our use case
 func connectionToDSN(c connection) string {
-	d := mysql.NewConfig()
+	d := mysqldriver.NewConfig()
 	d.User = c.User
 	d.Passwd = c.Pass
 	d.Net = "tcp"
@@ -66,7 +66,7 @@ func connectionToDSN(c connection) string {
 // checkIfInSource is a wrapper function that checks if the
 // the table for a given connection exists and panics if
 // if there is no table in that connection
-func checkIfInSource(s *cool.Database, t string) {
+func checkIfInSource(s *mysql.Database, t string) {
 	if ok, err := s.Exists("show tables like'"+t+"'", 0); err != nil {
 		panic(err)
 	} else if !ok {

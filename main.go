@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"reflect"
 	"strconv"
@@ -29,11 +30,13 @@ var (
 
 	connectionsFile = root.String("c", confDir+"/swoof/connections.yaml", "your connections file")
 
-	disableTransactions = root.Bool("disable-tx", false, "disables transactions for inserts, this will dramatically slow down imports")
-
 	skipData = root.Bool("n", false, "drop/create tables and triggers only, without importing data")
 
 	threads = root.Int("t", 4, "max concurrent tables at the same time, import stability may vary wildly between servers while increasing this")
+
+	all = root.Bool("all", false, "grabs all tables, specified tables are ignored")
+
+	verbose = root.Bool("v", false, "writes all queries to stdout")
 
 	// not entirely sure how much this really affects performance,
 	// since the performance bottleneck is almost guaranteed to be writing
@@ -55,7 +58,11 @@ func main() {
 	// parse our command line arguments and make sure we
 	// were given something that makes sense
 	root.ParseArgs(os.Args...)
-	if len(*args) < 3 {
+
+	if *all && len(*args) < 2 {
+		root.Usage()
+		os.Exit(1)
+	} else if !*all && len(*args) < 3 {
 		root.Usage()
 		os.Exit(1)
 	}
@@ -87,6 +94,9 @@ func main() {
 		}
 	}
 
+	blue := color.New(color.FgBlue).SprintFunc()
+	red := color.New(color.FgRed).SprintFunc()
+
 	// source connection is the first argument
 	// this is where our rows are coming from
 	src, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
@@ -96,7 +106,30 @@ func main() {
 
 	src.DisableUnusedColumnWarnings = true
 
-	tableNames, err := getTables(*aliasesFiles, args, src)
+	if *verbose {
+		src.Log = func(query string, params mysql.Params, duration time.Duration, cacheHit bool) {
+			fmt.Println(blue("src:"), query)
+		}
+	}
+
+	dst := func() *mysql.Database {
+		dst, err := mysql.NewFromDSN(destDSN, destDSN)
+		if err != nil {
+			panic(err)
+		}
+
+		dst.DisableUnusedColumnWarnings = true
+
+		if *verbose {
+			dst.Log = func(query string, params mysql.Params, duration time.Duration, cacheHit bool) {
+				fmt.Println(red("dst:"), query)
+			}
+		}
+
+		return dst
+	}
+
+	tableNames, err := getTables(*aliasesFiles, *all, args, src)
 	if err != nil {
 		panic(err)
 	}
@@ -114,6 +147,7 @@ func main() {
 			"from`information_schema`.`TABLES`"+
 			"where`table_schema`=database()"+
 			"and`table_name`in(@@Tables)"+
+			"and`table_type`='BASE TABLE'"+
 			"order by`data_length`+`index_length`desc", 0, mysql.Params{
 			"Tables": *tableNames,
 		})
@@ -125,6 +159,12 @@ func main() {
 	// our multi-progress bar ties right into our wait group
 	var wg sync.WaitGroup
 	pb := mpb.New(mpb.WithWaitGroup(&wg))
+
+	// we need to delay some funcs, most notably the foreign key constraint part.
+	// problem comes from us importing two tables that depend on each other; when
+	// one finishes before the other, if we create the constraints as well, then it will fail
+	// because the other table doesn't exist yet.
+	delayedFuncs := make(chan func(*mysql.Tx), len(*tableNames))
 
 	tableCount := 0
 	for table := range tables {
@@ -313,31 +353,7 @@ func main() {
 			// we need to be able to set foreign keys off, and the connection pooling
 			// by default makes this difficult. So instead we declare it here, and turn off
 			// pooling, almost creating our own "pool"
-			dstDB, err := mysql.NewFromDSN(destDSN, destDSN)
-			if err != nil {
-				panic(err)
-			}
-
-			src.DisableUnusedColumnWarnings = true
-
-			type Executor interface {
-				Exec(query string, params ...any) error
-				I() *mysql.Inserter
-			}
-
-			// use a transaction for all the dst commands, if tx is not disabled
-			// NOTE: if tx is disabled, then you will almost for sure get foreign key errors
-			var dst Executor
-			var cancel func() error
-			if *disableTransactions {
-				dst = dstDB
-			} else {
-				dst, cancel, err = dstDB.BeginTx()
-				defer cancel()
-				if err != nil {
-					panic(fmt.Errorf("failed to begin transaction: %w", err))
-				}
-			}
+			dst := dst()
 
 			// we need to disable this because importing two tables at the same time
 			// will almost certainly run into problems otherwise. Also dropping the table
@@ -442,72 +458,94 @@ func main() {
 			// we'll just tell the progress bar that we're finished
 			bar.SetTotal(bar.Current(), true)
 
-			// drop the old table now that our temp table is done
-			err = dst.Exec("drop table if exists`" + tableName + "`")
-			if err != nil {
-				panic(err)
-			}
-
-			// rename our temp table to the real table name
-			// we could do an atomic rename here, but the problem is that atomic renames
-			// also rename all the constraints of other tables pointing to our original table, and
-			// we want those constraints to point to our new table instead
-
-			// if you're doing this live, there *is* some down time, but other tools handle this the same
-			// way, so I don't think it's unreasonable if we do the same
-			err = dst.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`")
-			if err != nil {
-				panic(err)
-			}
-
-			// no we can add back our constraints if we have them
-			// converting our constraints to alter table syntax by removing our leading
-			// comma and adding the word "add" at the beginning of each line
-			if len(constraints) != 0 {
-				err = dst.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd"))
-				if err != nil {
-					panic(err)
-				}
-			}
-
-			// but we can't forget our triggers!
-			// lets grab the triggers from the source table and make sure
-			// we re-create them all on our destination
-			triggers := make(chan struct {
-				Trigger string
-			})
-			go func() {
-				defer close(triggers)
-				err = src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0)
-				if err != nil {
-					panic(err)
-				}
-			}()
-			for r := range triggers {
-				var trigger struct {
-					CreateMySQL string `mysql:"SQL Original Statement"`
-				}
-				err := src.Select(&trigger, "show create trigger`"+r.Trigger+"`", 0)
+			delayedFuncs <- func(tx *mysql.Tx) {
+				// drop the old table now that our temp table is done
+				err = tx.Exec("drop table if exists`" + tableName + "`")
 				if err != nil {
 					panic(err)
 				}
 
-				err = dst.Exec(trigger.CreateMySQL)
+				// rename our temp table to the real table name
+				// we could do an atomic rename here, but the problem is that atomic renames
+				// also rename all the constraints of other tables pointing to our original table, and
+				// we want those constraints to point to our new table instead
+
+				// if you're doing this live, there *is* some down time, but other tools handle this the same
+				// way, so I don't think it's unreasonable if we do the same
+				err = tx.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`")
 				if err != nil {
 					panic(err)
 				}
-			}
 
-			if tx, ok := dst.(*mysql.Tx); ok {
-				err = tx.Commit()
-				if err != nil {
-					panic(fmt.Errorf("failed to commit transaction: %w", err))
+				// no we can add back our constraints if we have them
+				// converting our constraints to alter table syntax by removing our leading
+				// comma and adding the word "add" at the beginning of each line
+				if len(constraints) != 0 {
+					err = tx.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd"))
+					if err != nil {
+						panic(err)
+					}
+				}
+
+				// but we can't forget our triggers!
+				// lets grab the triggers from the source table and make sure
+				// we re-create them all on our destination
+				triggers := make(chan struct {
+					Trigger string
+				})
+				go func() {
+					defer close(triggers)
+					err = src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0)
+					if err != nil {
+						panic(err)
+					}
+				}()
+				for r := range triggers {
+					var trigger struct {
+						CreateMySQL string `mysql:"SQL Original Statement"`
+					}
+					err := src.Select(&trigger, "show create trigger`"+r.Trigger+"`", 0)
+					if err != nil {
+						panic(err)
+					}
+
+					err = tx.Exec(trigger.CreateMySQL)
+					if err != nil {
+						panic(err)
+					}
 				}
 			}
 		}()
 	}
 
 	pb.Wait()
+
+	log.Println("finalizing imports...")
+	delayedFuncsGuard := make(chan struct{}, *threads)
+	delayedFuncsWg := sync.WaitGroup{}
+	tx, cancel, err := dst().BeginTx()
+	defer cancel()
+	if err != nil {
+		panic(err)
+	}
+	tx.Exec("set`FOREIGN_KEY_CHECKS`=0")
+	for i := 0; i < len(delayedFuncs); i++ {
+		delayedFuncsGuard <- struct{}{}
+
+		delayedFuncsWg.Add(1)
+		go func() {
+			defer func() { <-delayedFuncsGuard }()
+			defer delayedFuncsWg.Done()
+
+			f := <-delayedFuncs
+			f(tx)
+		}()
+	}
+
+	delayedFuncsWg.Wait()
+	if err = tx.Commit(); err != nil {
+		panic(err)
+	}
 
 	fmt.Println("finished importing", tableCount, english.PluralWord(tableCount, "table", ""), "in", time.Since(start))
 }

@@ -1,21 +1,20 @@
 package main
 
 import (
-	"fmt"
-	"io/ioutil"
+	"os"
 
-	cool "github.com/StirlingMarketingGroup/cool-mysql"
+	mysql "github.com/StirlingMarketingGroup/cool-mysql"
 	"gopkg.in/yaml.v2"
 )
 
 // getTables returns a map of tables
 // that can be checked for groups of tables
 // set by the configuation
-func getTables(file string, args *[]string, src *cool.Database) (*[]string, error) {
+func getTables(file string, inverse bool, args *[]string, src *mysql.Database) (*[]string, error) {
 	var tables map[string][]string
-	y, err := ioutil.ReadFile(file)
+	y, err := os.ReadFile(file)
 	if err != nil {
-		fmt.Printf("failed to read aliases file\ndefault location for config is %s/swoof/connections.yaml\n", confDir)
+		return nil, nil
 	} else {
 		err = yaml.Unmarshal(y, &tables)
 		if err != nil {
@@ -26,10 +25,26 @@ func getTables(file string, args *[]string, src *cool.Database) (*[]string, erro
 	var tableNames []string
 	checkTables(src, (*args)[2:], tables, &tableNames)
 
+	if inverse {
+		var newTableNames []string
+		err = src.Select(&newTableNames, "select`table_name`"+
+			"from`information_schema`.`TABLES`"+
+			"where`table_schema`=database()"+
+			"and`table_type`='BASE TABLE'{{ if .Tables }}"+
+			"and`table_name`not in(@@Tables){{ end }}", 0, mysql.Params{
+			"Tables": tableNames,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		tableNames = newTableNames
+	}
+
 	return &tableNames, nil
 }
 
-func checkTables(src *cool.Database, tableList []string, aliases map[string][]string, tableNames *[]string) {
+func checkTables(src *mysql.Database, tableList []string, aliases map[string][]string, tableNames *[]string) {
 	for _, t := range tableList {
 		if alias, ok := aliases[t]; ok {
 			checkTables(src, alias, aliases, tableNames)
