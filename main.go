@@ -40,6 +40,10 @@ var (
 
 	verbose = root.Bool("v", false, "writes all queries to stdout")
 
+	yes = root.Bool("yes", false, "skips all prompts")
+
+	no = root.Bool("no", false, "skips all prompts")
+
 	// not entirely sure how much this really affects performance,
 	// since the performance bottleneck is almost guaranteed to be writing
 	// the rows to the source
@@ -143,24 +147,36 @@ func main() {
 		panic(err)
 	}
 
-	if len(artifacts) != 0 && prompt("left over temp tables were found, delete them?") {
-		tx, cancel, err := dstConn.BeginTx()
-		defer cancel()
-		if err != nil {
-			panic(err)
+	if len(artifacts) != 0 {
+		var a bool
+		if *yes {
+			a = true
+		} else if *no {
+			a = false
+		} else {
+			b := prompt("left over temp tables were found, delete them?")
+			a = b
 		}
 
-		for _, t := range artifacts {
-			if !*dryRyn {
-				err = tx.Exec("drop table`" + t + "`")
-				if err != nil {
-					panic(err)
+		if a {
+			tx, cancel, err := dstConn.BeginTx()
+			defer cancel()
+			if err != nil {
+				panic(err)
+			}
+
+			for _, t := range artifacts {
+				if !*dryRyn {
+					err = tx.Exec("drop table`" + t + "`")
+					if err != nil {
+						panic(err)
+					}
 				}
 			}
-		}
 
-		if err = tx.Commit(); err != nil {
-			panic(err)
+			if err = tx.Commit(); err != nil {
+				panic(err)
+			}
 		}
 	}
 
