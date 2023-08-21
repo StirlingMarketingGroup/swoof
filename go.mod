@@ -5,9 +5,11 @@ go 1.21
 require (
 	github.com/Ompluscator/dynamic-struct v1.3.0
 	github.com/StirlingMarketingGroup/cool-mysql v0.0.0-20230818185952-6ebe133fb106
+	github.com/davecgh/go-spew v1.1.1
 	github.com/dustin/go-humanize v1.0.0
 	github.com/fatih/color v1.15.0
 	github.com/go-sql-driver/mysql v1.7.1
+	github.com/manifoldco/promptui v0.9.0
 	github.com/pkg/errors v0.9.1
 	github.com/posener/cmd v1.3.4
 	github.com/vbauerster/mpb/v5 v5.4.0
@@ -19,6 +21,7 @@ require (
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
 	github.com/cenkalti/backoff/v4 v4.2.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
+	github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/fatih/structtag v1.2.0 // indirect
 	github.com/go-redsync/redsync/v4 v4.8.1 // indirect

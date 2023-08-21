@@ -36,12 +36,14 @@ var (
 
 	all = root.Bool("all", false, "grabs all tables, specified tables are ignored")
 
+	dryRyn = root.Bool("dry-run", false, "doesn't actually execute any queries that have an effect")
+
 	verbose = root.Bool("v", false, "writes all queries to stdout")
 
 	// not entirely sure how much this really affects performance,
 	// since the performance bottleneck is almost guaranteed to be writing
 	// the rows to the source
-	rowBufferSize = root.Int("r", 50, "max rows buffer size. Will have this many rows downloaded and ready for importing")
+	rowBufferSize = root.Int("r", 1_000_000, "max rows buffer size. Will have this many rows downloaded and ready for importing")
 
 	tempTablePrefix = root.String("p", "_swoof_", "prefix of the temp table used for initial creation before the swap and drop")
 
@@ -129,6 +131,39 @@ func main() {
 		return dst
 	}
 
+	dstConn := dst()
+
+	var artifacts []string
+	err = dstConn.Select(&artifacts, "select`table_name`"+
+		"from`information_schema`.`TABLES`"+
+		"where`table_schema`=database()"+
+		"and`table_name`like concat(@@Prefix,'%')"+
+		"and`table_type`='BASE TABLE'", 0, *tempTablePrefix)
+	if err != nil {
+		panic(err)
+	}
+
+	if len(artifacts) != 0 && prompt("left over temp tables were found, delete them?") {
+		tx, cancel, err := dstConn.BeginTx()
+		defer cancel()
+		if err != nil {
+			panic(err)
+		}
+
+		for _, t := range artifacts {
+			if !*dryRyn {
+				err = tx.Exec("drop table`" + t + "`")
+				if err != nil {
+					panic(err)
+				}
+			}
+		}
+
+		if err = tx.Commit(); err != nil {
+			panic(err)
+		}
+	}
+
 	tableNames, err := getTables(*aliasesFiles, *all, args, src)
 	if err != nil {
 		panic(err)
@@ -138,9 +173,7 @@ func main() {
 	// this *should* help performance, so that the longest table doesn't start last
 	// and draw out the total process time
 	// this also has the nice side effect of de-duplicating our tables list
-	tables := make(chan struct {
-		TableName string `mysql:"table_name"`
-	})
+	tables := make(chan string, len(*tableNames))
 	go func() {
 		defer close(tables)
 		err = src.Select(tables, "select`table_name`"+
@@ -173,7 +206,7 @@ func main() {
 		// this makes sure we capture tableName in a way that it doesn't
 		// change on us within our loop
 		// And IMO this is cleaner than having the func below accept the string
-		tableName := table.TableName
+		tableName := table
 
 		// ensure we only run up to our max imports at a time
 		guard <- struct{}{}
@@ -269,7 +302,7 @@ func main() {
 
 				var v interface{}
 
-				// the switch through data types (differnet than column types, doesn't include lengths)
+				// the switch through data types (different than column types, doesn't include lengths)
 				// to determine the type of our struct field
 				// All of the field types are pointers so that our mysql scanning
 				// handles null values gracefully
@@ -314,7 +347,7 @@ func main() {
 				case "json":
 					// the json type here is important, because mysql needs
 					// char set info for json columns, since json is supposed to be utf8,
-					// and go treats this is bytes for some reason. mysql.JSON lets cool mysql
+					// and go treats this is bytes for some reason. Using json.RawMessag lets cool mysql
 					// know to surround the inlined value with charset info
 					v = new(json.RawMessage)
 				case "set":
@@ -385,10 +418,12 @@ func main() {
 
 			tempTableName := *tempTablePrefix + tableName
 
-			// delete the table from our destination
-			err = dst.Exec("drop table if exists`" + tempTableName + "`")
-			if err != nil {
-				panic(err)
+			if !*dryRyn {
+				// delete the table from our destination
+				err = dst.Exec("drop table if exists`" + tempTableName + "`")
+				if err != nil {
+					panic(err)
+				}
 			}
 
 			// since foreign key constraints have globally unique names (for some reason)
@@ -419,10 +454,12 @@ func main() {
 				table.CreateMySQL = table.CreateMySQL[:constraintsStart] + table.CreateMySQL[constraintsEnd:]
 			}
 
-			// now we can make the table on our destination
-			err = dst.Exec("CREATE TABLE `" + tempTableName + "`" + strings.TrimPrefix(table.CreateMySQL, "CREATE TABLE `"+tableName+"`"))
-			if err != nil {
-				panic(err)
+			if !*dryRyn {
+				// now we can make the table on our destination
+				err = dst.Exec("CREATE TABLE `" + tempTableName + "`" + strings.TrimPrefix(table.CreateMySQL, "CREATE TABLE `"+tableName+"`"))
+				if err != nil {
+					panic(err)
+				}
 			}
 
 			// our pretty bar config for the progress bars
@@ -440,7 +477,7 @@ func main() {
 				),
 			)
 
-			if !*skipData {
+			if !*skipData && !*dryRyn {
 				// and if we aren't skipping the data, start the import!
 				// Now this *does* have to be chunked because there's no way to stream
 				// rows to mysql, but cool mysql handles this for us, all it needs is the same
@@ -460,9 +497,11 @@ func main() {
 
 			delayedFuncs <- func(tx *mysql.Tx) {
 				// drop the old table now that our temp table is done
-				err = tx.Exec("drop table if exists`" + tableName + "`")
-				if err != nil {
-					panic(err)
+				if !*dryRyn {
+					err = tx.Exec("drop table if exists`" + tableName + "`")
+					if err != nil {
+						panic(err)
+					}
 				}
 
 				// rename our temp table to the real table name
@@ -472,15 +511,17 @@ func main() {
 
 				// if you're doing this live, there *is* some down time, but other tools handle this the same
 				// way, so I don't think it's unreasonable if we do the same
-				err = tx.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`")
-				if err != nil {
-					panic(err)
+				if !*dryRyn {
+					err = tx.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`")
+					if err != nil {
+						panic(err)
+					}
 				}
 
 				// no we can add back our constraints if we have them
 				// converting our constraints to alter table syntax by removing our leading
 				// comma and adding the word "add" at the beginning of each line
-				if len(constraints) != 0 {
+				if len(constraints) != 0 && !*dryRyn {
 					err = tx.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd"))
 					if err != nil {
 						panic(err)
@@ -509,9 +550,11 @@ func main() {
 						panic(err)
 					}
 
-					err = tx.Exec(trigger.CreateMySQL)
-					if err != nil {
-						panic(err)
+					if !*dryRyn {
+						err = tx.Exec(trigger.CreateMySQL)
+						if err != nil {
+							panic(err)
+						}
 					}
 				}
 			}
@@ -523,7 +566,7 @@ func main() {
 	log.Println("finalizing imports...")
 	delayedFuncsGuard := make(chan struct{}, *threads)
 	delayedFuncsWg := sync.WaitGroup{}
-	tx, cancel, err := dst().BeginTx()
+	tx, cancel, err := dstConn.BeginTx()
 	defer cancel()
 	if err != nil {
 		panic(err)
