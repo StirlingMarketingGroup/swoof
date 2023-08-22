@@ -131,8 +131,6 @@ func main() {
 		return dst
 	}
 
-	dstConn := dst()
-
 	tableNames, err := getTables(*aliasesFiles, *all, args, src)
 	if err != nil {
 		panic(err)
@@ -537,7 +535,7 @@ func main() {
 	log.Println("finalizing imports...")
 	guard = make(chan struct{}, *threads)
 	wg = sync.WaitGroup{}
-	tx, cancel, err := dstConn.BeginTx()
+	tx, cancel, err := dst().BeginTx()
 	defer cancel()
 	if err != nil {
 		panic(err)
