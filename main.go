@@ -133,27 +133,6 @@ func main() {
 
 	dstConn := dst()
 
-	var artifacts []string
-	err = dstConn.Select(&artifacts, "select`table_name`"+
-		"from`information_schema`.`TABLES`"+
-		"where`table_schema`=database()"+
-		"and`table_name`like concat(@@Prefix,'%')"+
-		"and`table_type`='BASE TABLE'", 0, *tempTablePrefix)
-	if err != nil {
-		panic(err)
-	}
-
-	if len(artifacts) != 0 {
-		for _, t := range artifacts {
-			if !*dryRyn {
-				err = dstConn.Exec("drop table`" + t + "`")
-				if err != nil {
-					panic(err)
-				}
-			}
-		}
-	}
-
 	tableNames, err := getTables(*aliasesFiles, *all, args, src)
 	if err != nil {
 		panic(err)
