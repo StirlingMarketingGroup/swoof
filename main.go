@@ -40,10 +40,6 @@ var (
 
 	verbose = root.Bool("v", false, "writes all queries to stdout")
 
-	yes = root.Bool("yes", false, "skips all prompts")
-
-	no = root.Bool("no", false, "skips all prompts")
-
 	// not entirely sure how much this really affects performance,
 	// since the performance bottleneck is almost guaranteed to be writing
 	// the rows to the source
@@ -148,34 +144,12 @@ func main() {
 	}
 
 	if len(artifacts) != 0 {
-		var a bool
-		if *yes {
-			a = true
-		} else if *no {
-			a = false
-		} else {
-			b := prompt("left over temp tables were found, delete them?")
-			a = b
-		}
-
-		if a {
-			tx, cancel, err := dstConn.BeginTx()
-			defer cancel()
-			if err != nil {
-				panic(err)
-			}
-
-			for _, t := range artifacts {
-				if !*dryRyn {
-					err = tx.Exec("drop table`" + t + "`")
-					if err != nil {
-						panic(err)
-					}
+		for _, t := range artifacts {
+			if !*dryRyn {
+				err = dstConn.Exec("drop table`" + t + "`")
+				if err != nil {
+					panic(err)
 				}
-			}
-
-			if err = tx.Commit(); err != nil {
-				panic(err)
 			}
 		}
 	}
@@ -478,39 +452,6 @@ func main() {
 				}
 			}
 
-			// our pretty bar config for the progress bars
-			// their documention lives over here https://github.com/vbauerster/mpb
-			bar := pb.AddBar(count.Count,
-				mpb.BarStyle("|▇▇ |"),
-				mpb.PrependDecorators(
-					decor.Name(color.HiBlueString(tableName)),
-					decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
-				),
-				mpb.AppendDecorators(
-					decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", ", decor.WCSyncWidth),
-					decor.AverageSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", decor.WCSyncWidth),
-					decor.AverageETA(decor.ET_STYLE_MMSS),
-				),
-			)
-
-			if !*skipData && !*dryRyn {
-				// and if we aren't skipping the data, start the import!
-				// Now this *does* have to be chunked because there's no way to stream
-				// rows to mysql, but cool mysql handles this for us, all it needs is the same
-				// channel we got from the select
-				err = dst.I().SetAfterRowExec(func(start time.Time) {
-					bar.Increment()
-					bar.DecoratorEwmaUpdate(time.Since(start))
-				}).Insert("insert into`"+tempTableName+"`", ch)
-				if err != nil {
-					panic(err)
-				}
-			}
-
-			// and just in case the rows have changed count since our count selection,
-			// we'll just tell the progress bar that we're finished
-			bar.SetTotal(bar.Current(), true)
-
 			delayedFuncs <- func(tx *mysql.Tx) {
 				// drop the old table now that our temp table is done
 				if !*dryRyn {
@@ -574,34 +515,67 @@ func main() {
 					}
 				}
 			}
+
+			// our pretty bar config for the progress bars
+			// their documention lives over here https://github.com/vbauerster/mpb
+			bar := pb.AddBar(count.Count,
+				mpb.BarStyle("|▇▇ |"),
+				mpb.PrependDecorators(
+					decor.Name(color.HiBlueString(tableName)),
+					decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
+				),
+				mpb.AppendDecorators(
+					decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", ", decor.WCSyncWidth),
+					decor.AverageSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", decor.WCSyncWidth),
+					decor.AverageETA(decor.ET_STYLE_MMSS),
+				),
+			)
+
+			if !*skipData && !*dryRyn {
+				// and if we aren't skipping the data, start the import!
+				// Now this *does* have to be chunked because there's no way to stream
+				// rows to mysql, but cool mysql handles this for us, all it needs is the same
+				// channel we got from the select
+				err = dst.I().SetAfterRowExec(func(start time.Time) {
+					bar.Increment()
+					bar.DecoratorEwmaUpdate(time.Since(start))
+				}).Insert("insert into`"+tempTableName+"`", ch)
+				if err != nil {
+					panic(err)
+				}
+			}
+
+			// and just in case the rows have changed count since our count selection,
+			// we'll just tell the progress bar that we're finished
+			bar.SetTotal(bar.Current(), true)
 		}()
 	}
 
 	pb.Wait()
 
+	close(delayedFuncs)
+
 	log.Println("finalizing imports...")
-	delayedFuncsGuard := make(chan struct{}, *threads)
-	delayedFuncsWg := sync.WaitGroup{}
+	guard = make(chan struct{}, *threads)
+	wg = sync.WaitGroup{}
 	tx, cancel, err := dstConn.BeginTx()
 	defer cancel()
 	if err != nil {
 		panic(err)
 	}
 	tx.Exec("set`FOREIGN_KEY_CHECKS`=0")
-	for i := 0; i < len(delayedFuncs); i++ {
-		delayedFuncsGuard <- struct{}{}
+	for f := range delayedFuncs {
+		guard <- struct{}{}
+		wg.Add(1)
+		go func(f func(*mysql.Tx)) {
+			defer func() { <-guard }()
+			defer wg.Done()
 
-		delayedFuncsWg.Add(1)
-		go func() {
-			defer func() { <-delayedFuncsGuard }()
-			defer delayedFuncsWg.Done()
-
-			f := <-delayedFuncs
 			f(tx)
-		}()
+		}(f)
 	}
 
-	delayedFuncsWg.Wait()
+	wg.Wait()
 	if err = tx.Commit(); err != nil {
 		panic(err)
 	}
