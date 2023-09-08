@@ -36,6 +36,8 @@ var (
 
 	all = root.Bool("all", false, "grabs all tables, specified tables are ignored")
 
+	insertIgnoreInto = root.Bool("insert-ignore", false, "inserts into the existing table without overwriting the existing rows")
+
 	dryRyn = root.Bool("dry-run", false, "doesn't actually execute any queries that have an effect")
 
 	verbose = root.Bool("v", false, "writes all queries to stdout")
@@ -374,120 +376,124 @@ func main() {
 				}
 			}
 
-			// now we get the table creation syntax from our source
-			var table struct {
-				CreateMySQL string `mysql:"Create Table"`
-			}
-			err = src.Select(&table, "show create table`"+tableName+"`", 0)
-			if err != nil {
-				panic(err)
-			}
+			var tempTableName string
 
-			tempTableName := *tempTablePrefix + tableName
-
-			if !*dryRyn {
-				// delete the table from our destination
-				err = dst.Exec("drop table if exists`" + tempTableName + "`")
+			if !*insertIgnoreInto {
+				// now we get the table creation syntax from our source
+				var table struct {
+					CreateMySQL string `mysql:"Create Table"`
+				}
+				err = src.Select(&table, "show create table`"+tableName+"`", 0)
 				if err != nil {
 					panic(err)
 				}
-			}
 
-			// since foreign key constraints have globally unique names (for some reason)
-			// we can't just create our temp table with constraints because
-			// the names will likely conflict with the table that already exists
+				tempTableName = *tempTablePrefix + tableName
 
-			// so we will strip the constraints here and add them back once we're done
-			var constraints string
-
-			// we can safely assume the constraints start like this because you can't
-			// constraints without columns!
-			constraintsStart := strings.Index(table.CreateMySQL, ",\n  CONSTRAINT ")
-			if constraintsStart != -1 {
-				// we have the start of our constraints block, and since mysql
-				// always (hopefully) gives them in a block, we can find the last
-				// constraint and everything in the middle is what we want
-				constraintsEnd := strings.LastIndex(table.CreateMySQL, ",\n  CONSTRAINT ")
-
-				// but we need the end of the line, so we'll get the byte index of the newline
-				// after our last index as our end marker
-				constraintsEnd = constraintsEnd + strings.IndexByte(table.CreateMySQL[constraintsEnd+2:], '\n') + 2
-
-				// then we can keep track of our constraints so we can add them back
-				// to our table once we've dropped the original table
-				constraints = table.CreateMySQL[constraintsStart:constraintsEnd]
-
-				// and store our create query without our constraints
-				table.CreateMySQL = table.CreateMySQL[:constraintsStart] + table.CreateMySQL[constraintsEnd:]
-			}
-
-			if !*dryRyn {
-				// now we can make the table on our destination
-				err = dst.Exec("CREATE TABLE `" + tempTableName + "`" + strings.TrimPrefix(table.CreateMySQL, "CREATE TABLE `"+tableName+"`"))
-				if err != nil {
-					panic(err)
-				}
-			}
-
-			delayedFuncs <- func(tx *mysql.Tx) {
-				// drop the old table now that our temp table is done
 				if !*dryRyn {
-					err = tx.Exec("drop table if exists`" + tableName + "`")
+					// delete the table from our destination
+					err = dst.Exec("drop table if exists`" + tempTableName + "`")
 					if err != nil {
 						panic(err)
 					}
 				}
 
-				// rename our temp table to the real table name
-				// we could do an atomic rename here, but the problem is that atomic renames
-				// also rename all the constraints of other tables pointing to our original table, and
-				// we want those constraints to point to our new table instead
+				// since foreign key constraints have globally unique names (for some reason)
+				// we can't just create our temp table with constraints because
+				// the names will likely conflict with the table that already exists
 
-				// if you're doing this live, there *is* some down time, but other tools handle this the same
-				// way, so I don't think it's unreasonable if we do the same
+				// so we will strip the constraints here and add them back once we're done
+				var constraints string
+
+				// we can safely assume the constraints start like this because you can't
+				// constraints without columns!
+				constraintsStart := strings.Index(table.CreateMySQL, ",\n  CONSTRAINT ")
+				if constraintsStart != -1 {
+					// we have the start of our constraints block, and since mysql
+					// always (hopefully) gives them in a block, we can find the last
+					// constraint and everything in the middle is what we want
+					constraintsEnd := strings.LastIndex(table.CreateMySQL, ",\n  CONSTRAINT ")
+
+					// but we need the end of the line, so we'll get the byte index of the newline
+					// after our last index as our end marker
+					constraintsEnd = constraintsEnd + strings.IndexByte(table.CreateMySQL[constraintsEnd+2:], '\n') + 2
+
+					// then we can keep track of our constraints so we can add them back
+					// to our table once we've dropped the original table
+					constraints = table.CreateMySQL[constraintsStart:constraintsEnd]
+
+					// and store our create query without our constraints
+					table.CreateMySQL = table.CreateMySQL[:constraintsStart] + table.CreateMySQL[constraintsEnd:]
+				}
+
 				if !*dryRyn {
-					err = tx.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`")
+					// now we can make the table on our destination
+					err = dst.Exec("CREATE TABLE `" + tempTableName + "`" + strings.TrimPrefix(table.CreateMySQL, "CREATE TABLE `"+tableName+"`"))
 					if err != nil {
 						panic(err)
 					}
 				}
 
-				// no we can add back our constraints if we have them
-				// converting our constraints to alter table syntax by removing our leading
-				// comma and adding the word "add" at the beginning of each line
-				if len(constraints) != 0 && !*dryRyn {
-					err = tx.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd"))
-					if err != nil {
-						panic(err)
-					}
-				}
-
-				// but we can't forget our triggers!
-				// lets grab the triggers from the source table and make sure
-				// we re-create them all on our destination
-				triggers := make(chan struct {
-					Trigger string
-				})
-				go func() {
-					defer close(triggers)
-					err = src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0)
-					if err != nil {
-						panic(err)
-					}
-				}()
-				for r := range triggers {
-					var trigger struct {
-						CreateMySQL string `mysql:"SQL Original Statement"`
-					}
-					err := src.Select(&trigger, "show create trigger`"+r.Trigger+"`", 0)
-					if err != nil {
-						panic(err)
-					}
-
+				delayedFuncs <- func(tx *mysql.Tx) {
+					// drop the old table now that our temp table is done
 					if !*dryRyn {
-						err = tx.Exec(trigger.CreateMySQL)
+						err = tx.Exec("drop table if exists`" + tableName + "`")
 						if err != nil {
 							panic(err)
+						}
+					}
+
+					// rename our temp table to the real table name
+					// we could do an atomic rename here, but the problem is that atomic renames
+					// also rename all the constraints of other tables pointing to our original table, and
+					// we want those constraints to point to our new table instead
+
+					// if you're doing this live, there *is* some down time, but other tools handle this the same
+					// way, so I don't think it's unreasonable if we do the same
+					if !*dryRyn {
+						err = tx.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`")
+						if err != nil {
+							panic(err)
+						}
+					}
+
+					// no we can add back our constraints if we have them
+					// converting our constraints to alter table syntax by removing our leading
+					// comma and adding the word "add" at the beginning of each line
+					if len(constraints) != 0 && !*dryRyn {
+						err = tx.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd"))
+						if err != nil {
+							panic(err)
+						}
+					}
+
+					// but we can't forget our triggers!
+					// lets grab the triggers from the source table and make sure
+					// we re-create them all on our destination
+					triggers := make(chan struct {
+						Trigger string
+					})
+					go func() {
+						defer close(triggers)
+						err = src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0)
+						if err != nil {
+							panic(err)
+						}
+					}()
+					for r := range triggers {
+						var trigger struct {
+							CreateMySQL string `mysql:"SQL Original Statement"`
+						}
+						err := src.Select(&trigger, "show create trigger`"+r.Trigger+"`", 0)
+						if err != nil {
+							panic(err)
+						}
+
+						if !*dryRyn {
+							err = tx.Exec(trigger.CreateMySQL)
+							if err != nil {
+								panic(err)
+							}
 						}
 					}
 				}
@@ -513,12 +519,21 @@ func main() {
 				// Now this *does* have to be chunked because there's no way to stream
 				// rows to mysql, but cool mysql handles this for us, all it needs is the same
 				// channel we got from the select
-				err = dst.I().SetAfterRowExec(func(start time.Time) {
+				inserter := dst.I().SetAfterRowExec(func(start time.Time) {
 					bar.Increment()
 					bar.DecoratorEwmaUpdate(time.Since(start))
-				}).Insert("insert into`"+tempTableName+"`", ch)
-				if err != nil {
-					panic(err)
+				})
+
+				if !*insertIgnoreInto {
+					err = inserter.Insert("insert into`"+tempTableName+"`", ch)
+					if err != nil {
+						panic(err)
+					}
+				} else {
+					err = inserter.Insert("insert ignore into`"+tableName+"`", ch)
+					if err != nil {
+						panic(err)
+					}
 				}
 			}
 
@@ -530,31 +545,33 @@ func main() {
 
 	pb.Wait()
 
-	close(delayedFuncs)
+	if !*insertIgnoreInto {
+		close(delayedFuncs)
 
-	log.Println("finalizing imports...")
-	guard = make(chan struct{}, *threads)
-	wg = sync.WaitGroup{}
-	tx, cancel, err := dst().BeginTx()
-	defer cancel()
-	if err != nil {
-		panic(err)
-	}
-	tx.Exec("set`FOREIGN_KEY_CHECKS`=0")
-	for f := range delayedFuncs {
-		guard <- struct{}{}
-		wg.Add(1)
-		go func(f func(*mysql.Tx)) {
-			defer func() { <-guard }()
-			defer wg.Done()
+		log.Println("finalizing imports...")
+		guard = make(chan struct{}, *threads)
+		wg = sync.WaitGroup{}
+		tx, cancel, err := dst().BeginTx()
+		defer cancel()
+		if err != nil {
+			panic(err)
+		}
+		tx.Exec("set`FOREIGN_KEY_CHECKS`=0")
+		for f := range delayedFuncs {
+			guard <- struct{}{}
+			wg.Add(1)
+			go func(f func(*mysql.Tx)) {
+				defer func() { <-guard }()
+				defer wg.Done()
 
-			f(tx)
-		}(f)
-	}
+				f(tx)
+			}(f)
+		}
 
-	wg.Wait()
-	if err = tx.Commit(); err != nil {
-		panic(err)
+		wg.Wait()
+		if err = tx.Commit(); err != nil {
+			panic(err)
+		}
 	}
 
 	fmt.Println("finished importing", tableCount, english.PluralWord(tableCount, "table", ""), "in", time.Since(start))
