@@ -94,6 +94,13 @@ func main() {
 				panic(errors.Errorf("can't use %q as a destination per your config", destDSN))
 			}
 
+			// we will disable foreign key checks on the destination
+			// since we are importing more than one table at a time,
+			// otherwise we *will* get errors about foreign key constraints
+			if _, ok := c.Params["foreign_key_checks"]; !ok {
+				c.Params["foreign_key_checks"] = "0"
+			}
+
 			destDSN = connectionToDSN(c)
 		}
 	}
@@ -111,26 +118,44 @@ func main() {
 	src.DisableUnusedColumnWarnings = true
 
 	if *verbose {
-		src.Log = func(query string, params mysql.Params, duration time.Duration, cacheHit bool) {
-			fmt.Println(blue("src:"), query)
+		src.Log = func(detail mysql.LogDetail) {
+			fmt.Println(blue("src:"), detail.Query)
 		}
 	}
 
-	dst := func() *mysql.Database {
-		dst, err := mysql.NewFromDSN(destDSN, destDSN)
-		if err != nil {
-			panic(err)
+	logFn := src.Log
+	src.Log = func(detail mysql.LogDetail) {
+		if logFn != nil {
+			logFn(detail)
 		}
 
-		dst.DisableUnusedColumnWarnings = true
+		if detail.Error != nil {
+			panic(detail.Error)
+		}
+	}
 
-		if *verbose {
-			dst.Log = func(query string, params mysql.Params, duration time.Duration, cacheHit bool) {
-				fmt.Println(red("dst:"), query)
-			}
+	dst, err := mysql.NewFromDSN(destDSN, destDSN)
+	if err != nil {
+		panic(err)
+	}
+
+	dst.DisableUnusedColumnWarnings = true
+
+	if *verbose {
+		dst.Log = func(detail mysql.LogDetail) {
+			fmt.Println(red("dst:"), detail.Query)
+		}
+	}
+
+	logFn = dst.Log
+	dst.Log = func(detail mysql.LogDetail) {
+		if logFn != nil {
+			logFn(detail)
 		}
 
-		return dst
+		if detail.Error != nil {
+			panic(detail.Error)
+		}
 	}
 
 	tableNames, err := getTables(*aliasesFiles, *all, args, src)
@@ -351,20 +376,6 @@ func main() {
 				}
 			}()
 
-			// we make the dest connection in the loop, once per table, because
-			// we need to be able to set foreign keys off, and the connection pooling
-			// by default makes this difficult. So instead we declare it here, and turn off
-			// pooling, almost creating our own "pool"
-			dst := dst()
-
-			// we need to disable this because importing two tables at the same time
-			// will almost certainly run into problems otherwise. Also dropping the table
-			// will do the same
-			err = dst.Exec("set`FOREIGN_KEY_CHECKS`=0")
-			if err != nil {
-				panic(err)
-			}
-
 			var count struct {
 				Count int64
 			}
@@ -551,12 +562,11 @@ func main() {
 		log.Println("finalizing imports...")
 		guard = make(chan struct{}, *threads)
 		wg = sync.WaitGroup{}
-		tx, cancel, err := dst().BeginTx()
+		tx, cancel, err := dst.BeginTx()
 		defer cancel()
 		if err != nil {
 			panic(err)
 		}
-		tx.Exec("set`FOREIGN_KEY_CHECKS`=0")
 		for f := range delayedFuncs {
 			guard <- struct{}{}
 			wg.Add(1)
