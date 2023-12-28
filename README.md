@@ -42,6 +42,9 @@ swoof [flags] production localhost table1 table2 table3
 - `-c` your connections file (default `~/.config/swoof/connections.yaml` on Linux, more info below)
 - `-a` your alises file (default `~/.config/swoof/aliases.yaml` on Linux, more info below)
 - `-all` grabs all tables, specified tables/aliases are ignored (default false)
+- `-funcs` imports all functions after tables
+- `-views` imports all views after tables and functions
+- `-procs` imports all procedures after tables, functions, and views
 - `-n` drop/create tables and triggers only, without importing data
 - `-p` prefix of the temp table used for initial creation before the swap and drop (default `_swoof_`)
 - `-r` value
