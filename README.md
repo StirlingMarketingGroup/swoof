@@ -19,7 +19,7 @@ You will need Golang, which you can get from here <https://golang.org/doc/instal
 All you need to download, build, and install is the following command:
 
 ```shell
-go install github.com/StirlingMarketingGroup/swoof@laster
+go install github.com/StirlingMarketingGroup/swoof@latest
 ```
 
 If you already have `$GOPATH/bin` in your path, this should be all you need! If you don't though, you can add this to to your `~/.bashrc` or `~/.zshrc` or whatever file your shell runs on login.
