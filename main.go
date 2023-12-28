@@ -63,6 +63,8 @@ var (
 		"swoof [flags] production localhost table1 table2 table3")
 )
 
+var definerRegexp = regexp.MustCompile(`\sDEFINER\s*=\s*[^ ]+`)
+
 func main() {
 	start := time.Now()
 
@@ -195,7 +197,7 @@ func main() {
 	// problem comes from us importing two tables that depend on each other; when
 	// one finishes before the other, if we create the constraints as well, then it will fail
 	// because the other table doesn't exist yet.
-	delayedFuncs := make(chan func(*mysql.Tx), len(*tableNames))
+	delayedFuncs := make(chan func(), len(*tableNames))
 
 	tableCount := 0
 	for table := range tables {
@@ -367,18 +369,20 @@ func main() {
 
 			columnsQuoted := columnsQuotedBld.String()
 
-			// oh yeah, that's just one query. We don't actually have to chunk this selection
-			// because we're dealing with rows as they come in, instead of trying to select them
-			// all into memory or something first, which makes this code dramatically simpler
-			// and should work with tables of all sizes
-			go func() {
-				defer chRef.Close()
+			if !*skipData {
+				// oh yeah, that's just one query. We don't actually have to chunk this selection
+				// because we're dealing with rows as they come in, instead of trying to select them
+				// all into memory or something first, which makes this code dramatically simpler
+				// and should work with tables of all sizes
+				go func() {
+					defer chRef.Close()
 
-				err := src.Select(ch, "select /*+ MAX_EXECUTION_TIME(2147483647) */ "+columnsQuoted+"from`"+tableName+"`", 0)
-				if err != nil {
-					panic(err)
-				}
-			}()
+					err := src.Select(ch, "select /*+ MAX_EXECUTION_TIME(2147483647) */ "+columnsQuoted+"from`"+tableName+"`", 0)
+					if err != nil {
+						panic(err)
+					}
+				}()
+			}
 
 			var count struct {
 				Count int64
@@ -449,7 +453,13 @@ func main() {
 					}
 				}
 
-				delayedFuncs <- func(tx *mysql.Tx) {
+				delayedFuncs <- func() {
+					tx, cancel, err := dst.BeginTx()
+					defer cancel()
+					if err != nil {
+						panic(err)
+					}
+
 					// drop the old table now that our temp table is done
 					if !*dryRyn {
 						err = tx.Exec("drop table if exists`" + tableName + "`")
@@ -504,12 +514,21 @@ func main() {
 							panic(err)
 						}
 
+						// we need to remove the definer from the trigger
+						// because the definer is the user that created the trigger
+						// and that user may not exist on the destination
+						trigger.CreateMySQL = definerRegexp.ReplaceAllString(trigger.CreateMySQL, "")
+
 						if !*dryRyn {
 							err = tx.Exec(trigger.CreateMySQL)
 							if err != nil {
 								panic(err)
 							}
 						}
+					}
+
+					if err = tx.Commit(); err != nil {
+						panic(err)
 					}
 				}
 			}
@@ -564,34 +583,14 @@ func main() {
 		close(delayedFuncs)
 
 		log.Println("finalizing table imports...")
-		guard = make(chan struct{}, *threads)
-		wg = sync.WaitGroup{}
-		tx, cancel, err := dst.BeginTx()
-		defer cancel()
-		if err != nil {
-			panic(err)
-		}
+
 		for f := range delayedFuncs {
-			guard <- struct{}{}
-			wg.Add(1)
-			go func(f func(*mysql.Tx)) {
-				defer func() { <-guard }()
-				defer wg.Done()
-
-				f(tx)
-			}(f)
-		}
-
-		wg.Wait()
-		if err = tx.Commit(); err != nil {
-			panic(err)
+			f()
 		}
 	}
 
 	if *funcs {
 		fmt.Println("importing functions...")
-
-		definerRegexp := regexp.MustCompile(`\sDEFINER\s*=\s*[^ ]+`)
 
 		var funcs []struct {
 			FuncName string `mysql:"ROUTINE_NAME"`
@@ -632,8 +631,6 @@ func main() {
 	if *views {
 		fmt.Println("importing views...")
 
-		definerRegexp := regexp.MustCompile(`\sDEFINER\s*=\s*[^ ]+`)
-
 		var views []struct {
 			ViewName string `mysql:"TABLE_NAME"`
 		}
@@ -672,8 +669,6 @@ func main() {
 
 	if *procs {
 		fmt.Println("importing stored procedures...")
-
-		definerRegexp := regexp.MustCompile(`\sDEFINER\s*=\s*[^ ]+`)
 
 		var procs []struct {
 			ProcName string `mysql:"ROUTINE_NAME"`
