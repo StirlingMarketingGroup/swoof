@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 
 	mysql "github.com/StirlingMarketingGroup/cool-mysql"
@@ -13,9 +14,14 @@ import (
 func getTables(file string, inverse bool, args *[]string, src *mysql.Database) (*[]string, error) {
 	var tables map[string][]string
 	y, err := os.ReadFile(file)
+	if errors.Is(err, os.ErrNotExist) {
+		err = nil
+	}
 	if err != nil {
-		return nil, nil
-	} else {
+		return nil, err
+	}
+
+	if y != nil {
 		err = yaml.Unmarshal(y, &tables)
 		if err != nil {
 			return nil, err
