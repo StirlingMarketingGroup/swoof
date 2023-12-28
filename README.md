@@ -1,6 +1,6 @@
 # Swoof
 
-Just swoof it in. Ultra fast MySQL table importer. But not too fast.
+Just swoof it in. Ultra fast MySQL table importer.
 
 ![Swoof](swoof.gif)
 
@@ -16,7 +16,7 @@ You will need Golang, which you can get from here <https://golang.org/doc/instal
 
 ## Installing
 
-All you need to download, build, and install is the following command (including the dots, Go's neat!)
+All you need to download, build, and install is the following command:
 
 ```shell
 go install github.com/StirlingMarketingGroup/swoof@master
