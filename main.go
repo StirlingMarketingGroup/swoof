@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +43,12 @@ var (
 
 	verbose = root.Bool("v", false, "writes all queries to stdout")
 
+	funcs = root.Bool("funcs", false, "imports all functions after tables")
+
+	views = root.Bool("views", false, "imports all views after tables and funcs")
+
+	procs = root.Bool("procs", false, "imports all stored procedures after tables, funcs, and views")
+
 	// not entirely sure how much this really affects performance,
 	// since the performance bottleneck is almost guaranteed to be writing
 	// the rows to the source
@@ -63,10 +70,7 @@ func main() {
 	// were given something that makes sense
 	root.ParseArgs(os.Args...)
 
-	if *all && len(*args) < 2 {
-		root.Usage()
-		os.Exit(1)
-	} else if !*all && len(*args) < 3 {
+	if len(*args) < 2 {
 		root.Usage()
 		os.Exit(1)
 	}
@@ -123,10 +127,10 @@ func main() {
 		}
 	}
 
-	logFn := src.Log
+	logFnSrc := src.Log
 	src.Log = func(detail mysql.LogDetail) {
-		if logFn != nil {
-			logFn(detail)
+		if logFnSrc != nil {
+			logFnSrc(detail)
 		}
 
 		if detail.Error != nil {
@@ -147,10 +151,10 @@ func main() {
 		}
 	}
 
-	logFn = dst.Log
+	logFnDst := dst.Log
 	dst.Log = func(detail mysql.LogDetail) {
-		if logFn != nil {
-			logFn(detail)
+		if logFnDst != nil {
+			logFnDst(detail)
 		}
 
 		if detail.Error != nil {
@@ -559,7 +563,7 @@ func main() {
 	if !*insertIgnoreInto {
 		close(delayedFuncs)
 
-		log.Println("finalizing imports...")
+		log.Println("finalizing table imports...")
 		guard = make(chan struct{}, *threads)
 		wg = sync.WaitGroup{}
 		tx, cancel, err := dst.BeginTx()
@@ -581,6 +585,129 @@ func main() {
 		wg.Wait()
 		if err = tx.Commit(); err != nil {
 			panic(err)
+		}
+	}
+
+	if *funcs {
+		fmt.Println("importing functions...")
+
+		definerRegexp := regexp.MustCompile(`\sDEFINER\s*=\s*[^ ]+`)
+
+		var funcs []struct {
+			FuncName string `mysql:"ROUTINE_NAME"`
+		}
+		err = src.Select(&funcs, "select`ROUTINE_NAME`"+
+			"from`information_schema`.`ROUTINES`"+
+			"where`ROUTINE_SCHEMA`=database()"+
+			"and`ROUTINE_TYPE`='FUNCTION'", 0)
+		if err != nil {
+			panic(err)
+		}
+
+		for _, f := range funcs {
+			var funcInfo struct {
+				CreateMySQL string `mysql:"Create Function"`
+			}
+			err = src.Select(&funcInfo, "show create function`"+f.FuncName+"`", 0)
+			if err != nil {
+				panic(err)
+			}
+
+			if !*dryRyn {
+				err = dst.Exec("drop function if exists`" + f.FuncName + "`")
+				if err != nil {
+					panic(err)
+				}
+
+				funcInfo.CreateMySQL = definerRegexp.ReplaceAllString(funcInfo.CreateMySQL, "")
+
+				err = dst.Exec(funcInfo.CreateMySQL)
+				if err != nil {
+					panic(err)
+				}
+			}
+		}
+	}
+
+	if *views {
+		fmt.Println("importing views...")
+
+		definerRegexp := regexp.MustCompile(`\sDEFINER\s*=\s*[^ ]+`)
+
+		var views []struct {
+			ViewName string `mysql:"TABLE_NAME"`
+		}
+		err = src.Select(&views, "select`TABLE_NAME`"+
+			"from`information_schema`.`TABLES`"+
+			"where`TABLE_SCHEMA`=database()"+
+			"and`TABLE_TYPE`='VIEW'", 0)
+		if err != nil {
+			panic(err)
+		}
+
+		for _, v := range views {
+			var view struct {
+				CreateMySQL string `mysql:"Create View"`
+			}
+			err = src.Select(&view, "show create view`"+v.ViewName+"`", 0)
+			if err != nil {
+				panic(err)
+			}
+
+			if !*dryRyn {
+				err = dst.Exec("drop view if exists`" + v.ViewName + "`")
+				if err != nil {
+					panic(err)
+				}
+
+				view.CreateMySQL = definerRegexp.ReplaceAllString(view.CreateMySQL, "")
+
+				err = dst.Exec(view.CreateMySQL)
+				if err != nil {
+					panic(err)
+				}
+			}
+		}
+	}
+
+	if *procs {
+		fmt.Println("importing stored procedures...")
+
+		definerRegexp := regexp.MustCompile(`\sDEFINER\s*=\s*[^ ]+`)
+
+		var procs []struct {
+			ProcName string `mysql:"ROUTINE_NAME"`
+		}
+		err = src.Select(&procs, "select`ROUTINE_NAME`"+
+			"from`information_schema`.`ROUTINES`"+
+			"where`ROUTINE_SCHEMA`=database()"+
+			"and`ROUTINE_TYPE`='PROCEDURE'", 0)
+		if err != nil {
+			panic(err)
+		}
+
+		for _, p := range procs {
+			var procInfo struct {
+				CreateMySQL string `mysql:"Create Procedure"`
+			}
+			err = src.Select(&procInfo, "show create procedure`"+p.ProcName+"`", 0)
+			if err != nil {
+				panic(err)
+			}
+
+			if !*dryRyn {
+				err = dst.Exec("drop procedure if exists`" + p.ProcName + "`")
+				if err != nil {
+					panic(err)
+				}
+
+				procInfo.CreateMySQL = definerRegexp.ReplaceAllString(procInfo.CreateMySQL, "")
+
+				err = dst.Exec(procInfo.CreateMySQL)
+				if err != nil {
+					panic(err)
+				}
+			}
 		}
 	}
 
