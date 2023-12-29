@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
 	"reflect"
@@ -49,6 +48,8 @@ var (
 
 	procs = root.Bool("procs", false, "imports all stored procedures after tables, funcs, and views")
 
+	noProgress = root.Bool("no-progress", false, "disables the progress bars")
+
 	// not entirely sure how much this really affects performance,
 	// since the performance bottleneck is almost guaranteed to be writing
 	// the rows to the source
@@ -75,6 +76,10 @@ func main() {
 	if len(*args) < 2 {
 		root.Usage()
 		os.Exit(1)
+	}
+
+	if *skipData {
+		*noProgress = true
 	}
 
 	// guard channel of structs makes sure we can easily block for
@@ -125,7 +130,7 @@ func main() {
 
 	if *verbose {
 		src.Log = func(detail mysql.LogDetail) {
-			fmt.Println(blue("src:"), detail.Query)
+			log.Println(blue("src:"), detail.Query)
 		}
 	}
 
@@ -149,7 +154,7 @@ func main() {
 
 	if *verbose {
 		dst.Log = func(detail mysql.LogDetail) {
-			fmt.Println(red("dst:"), detail.Query)
+			log.Println(red("dst:"), detail.Query)
 		}
 	}
 
@@ -191,7 +196,10 @@ func main() {
 
 	// our multi-progress bar ties right into our wait group
 	var wg sync.WaitGroup
-	pb := mpb.New(mpb.WithWaitGroup(&wg))
+	var pb *mpb.Progress
+	if !*noProgress {
+		pb = mpb.New(mpb.WithWaitGroup(&wg))
+	}
 
 	// we need to delay some funcs, most notably the foreign key constraint part.
 	// problem comes from us importing two tables that depend on each other; when
@@ -533,30 +541,39 @@ func main() {
 				}
 			}
 
-			// our pretty bar config for the progress bars
-			// their documention lives over here https://github.com/vbauerster/mpb
-			bar := pb.AddBar(count.Count,
-				mpb.BarStyle("|▇▇ |"),
-				mpb.PrependDecorators(
-					decor.Name(color.HiBlueString(tableName)),
-					decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
-				),
-				mpb.AppendDecorators(
-					decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", ", decor.WCSyncWidth),
-					decor.AverageSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", decor.WCSyncWidth),
-					decor.AverageETA(decor.ET_STYLE_MMSS),
-				),
-			)
+			var bar *mpb.Bar
+			if !*noProgress {
+				// our pretty bar config for the progress bars
+				// their documention lives over here https://github.com/vbauerster/mpb
+				bar = pb.AddBar(count.Count,
+					mpb.BarStyle("|▇▇ |"),
+					mpb.PrependDecorators(
+						decor.Name(color.HiBlueString(tableName)),
+						decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
+					),
+					mpb.AppendDecorators(
+						decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", ", decor.WCSyncWidth),
+						decor.AverageSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", decor.WCSyncWidth),
+						decor.AverageETA(decor.ET_STYLE_MMSS),
+					),
+				)
+			} else {
+				log.Println("importing", tableName)
+			}
 
 			if !*skipData && !*dryRyn {
 				// and if we aren't skipping the data, start the import!
 				// Now this *does* have to be chunked because there's no way to stream
 				// rows to mysql, but cool mysql handles this for us, all it needs is the same
 				// channel we got from the select
-				inserter := dst.I().SetAfterRowExec(func(start time.Time) {
-					bar.Increment()
-					bar.DecoratorEwmaUpdate(time.Since(start))
-				})
+				inserter := dst.I()
+
+				if !*noProgress {
+					inserter = inserter.SetAfterRowExec(func(start time.Time) {
+						bar.Increment()
+						bar.DecoratorEwmaUpdate(time.Since(start))
+					})
+				}
 
 				if !*insertIgnoreInto {
 					err = inserter.Insert("insert into`"+tempTableName+"`", ch)
@@ -571,13 +588,19 @@ func main() {
 				}
 			}
 
-			// and just in case the rows have changed count since our count selection,
-			// we'll just tell the progress bar that we're finished
-			bar.SetTotal(bar.Current(), true)
+			if !*noProgress {
+				// and just in case the rows have changed count since our count selection,
+				// we'll just tell the progress bar that we're finished
+				bar.SetTotal(bar.Current(), true)
+			}
 		}()
 	}
 
-	pb.Wait()
+	if !*noProgress {
+		pb.Wait()
+	} else {
+		wg.Wait()
+	}
 
 	if !*insertIgnoreInto {
 		close(delayedFuncs)
@@ -590,7 +613,7 @@ func main() {
 	}
 
 	if *funcs {
-		fmt.Println("importing functions...")
+		log.Println("importing functions...")
 
 		var funcs []struct {
 			FuncName string `mysql:"ROUTINE_NAME"`
@@ -629,7 +652,7 @@ func main() {
 	}
 
 	if *views {
-		fmt.Println("importing views...")
+		log.Println("importing views...")
 
 		var views []struct {
 			ViewName string `mysql:"TABLE_NAME"`
@@ -668,7 +691,7 @@ func main() {
 	}
 
 	if *procs {
-		fmt.Println("importing stored procedures...")
+		log.Println("importing stored procedures...")
 
 		var procs []struct {
 			ProcName string `mysql:"ROUTINE_NAME"`
@@ -706,5 +729,5 @@ func main() {
 		}
 	}
 
-	fmt.Println("finished importing", tableCount, english.PluralWord(tableCount, "table", ""), "in", time.Since(start))
+	log.Println("finished importing", tableCount, english.PluralWord(tableCount, "table", ""), "in", time.Since(start))
 }
