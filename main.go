@@ -105,6 +105,10 @@ func main() {
 				panic(errors.Errorf("can't use %q as a destination per your config", destDSN))
 			}
 
+			if c.Params == nil {
+				c.Params = make(map[string]string)
+			}
+
 			// we will disable foreign key checks on the destination
 			// since we are importing more than one table at a time,
 			// otherwise we *will* get errors about foreign key constraints
