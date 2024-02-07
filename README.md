@@ -29,6 +29,15 @@ export GOPATH=$HOME/go # if you don't already have a GOPATH set
 export PATH=$PATH:$GOPATH/bin
 ```
 
+## Docker Alternative
+For those who use Docker for everything:
+```shell
+docker build -t swoof .
+docker run --rm swoof [flags] [source] [destination]
+# This example volume mount is to demonstrate the correct path in the container:
+docker run --rm -v ./connections.yaml://.config/swoof/connections.yaml swoof
+```
+
 ## Usage
 
 ```shell
