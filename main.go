@@ -255,7 +255,7 @@ func main() {
 				panic(err)
 			}
 			if ok {
-				columnInfoCols += ",`GENERATION_EXPRESSION`"
+				columnInfoCols += ",IFNULL(`GENERATION_EXPRESSION`,'')as`GENERATION_EXPRESSION`"
 			}
 
 			// in this query we're simply getting all the details about our column names
