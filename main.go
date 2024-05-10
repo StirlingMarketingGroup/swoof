@@ -243,26 +243,15 @@ func main() {
 				GenerationExpression string `mysql:"GENERATION_EXPRESSION"`
 			})
 
-			// we need to check to see if the db supports generated columns
-			// if it doesn't, our query to get column info will fail
-			columnInfoCols := "`COLUMN_NAME`,`ORDINAL_POSITION`,`DATA_TYPE`,`COLUMN_TYPE`"
-			ok, err := src.Exists("select 0 "+
-				"from`information_schema`.`columns`"+
-				"where`TABLE_SCHEMA`='INFORMATION_SCHEMA'"+
-				"and`table_name`='columns'"+
-				"and`column_name`='GENERATION_EXPRESSION'", 0)
-			if err != nil {
-				panic(err)
-			}
-			if ok {
-				columnInfoCols += ",IFNULL(`GENERATION_EXPRESSION`,'')as`GENERATION_EXPRESSION`"
-			}
-
 			// in this query we're simply getting all the details about our column names
 			// so we can make a dynamic struct that the rows can fit into
 			go func() {
 				defer close(columns)
-				err := src.Select(columns, "select"+columnInfoCols+
+				// select every column even though it's evil.
+				// `GENERATION_EXPRESSION` sometimes exists and sometimes doesn't, so we can't select for it.
+				// You MAY be able to check the `INFORMATION_SCHEMA` table for column info on `INFORMATION_SCHEMA` itself
+				// but Aurora MySQL doesn't seem to have values for this, unlike regular MySQL.
+				err := src.Select(columns, "select*"
 					"from`INFORMATION_SCHEMA`.`columns`"+
 					"where`TABLE_SCHEMA`=database()"+
 					"and`table_name`='"+tableName+"'"+
