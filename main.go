@@ -251,7 +251,7 @@ func main() {
 				// `GENERATION_EXPRESSION` sometimes exists and sometimes doesn't, so we can't select for it.
 				// You MAY be able to check the `INFORMATION_SCHEMA` table for column info on `INFORMATION_SCHEMA` itself
 				// but Aurora MySQL doesn't seem to have values for this, unlike regular MySQL.
-				err := src.Select(columns, "select*"
+				err := src.Select(columns, "select*"+
 					"from`INFORMATION_SCHEMA`.`columns`"+
 					"where`TABLE_SCHEMA`=database()"+
 					"and`table_name`='"+tableName+"'"+
