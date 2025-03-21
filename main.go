@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -17,8 +18,8 @@ import (
 	"github.com/fatih/color"
 	"github.com/pkg/errors"
 	"github.com/posener/cmd"
-	"github.com/vbauerster/mpb/v5"
-	"github.com/vbauerster/mpb/v5/decor"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 )
 
 var confDir, _ = os.UserConfigDir()
@@ -48,12 +49,14 @@ var (
 
 	procs = root.Bool("procs", false, "imports all stored procedures after tables, funcs, and views")
 
-	noProgress = root.Bool("no-progress", false, "disables the progress bars")
+	noProgressBars = root.Bool("no-progress", false, "disables the progress bars")
+
+	skipCount = root.Bool("skip-count", false, "skips the count query for each table, which can be slow for large tables")
 
 	// not entirely sure how much this really affects performance,
 	// since the performance bottleneck is almost guaranteed to be writing
 	// the rows to the source
-	rowBufferSize = root.Int("r", 1_000_000, "max rows buffer size. Will have this many rows downloaded and ready for importing")
+	rowBufferSize = root.Int("r", 10_000, "max rows buffer size. Will have this many rows downloaded and ready for importing")
 
 	tempTablePrefix = root.String("p", "_swoof_", "prefix of the temp table used for initial creation before the swap and drop")
 
@@ -79,7 +82,11 @@ func main() {
 	}
 
 	if *skipData {
-		*noProgress = true
+		*noProgressBars = true
+	}
+
+	if *noProgressBars {
+		*skipCount = true
 	}
 
 	// guard channel of structs makes sure we can easily block for
@@ -88,6 +95,8 @@ func main() {
 
 	sourceDSN := (*args)[0]
 	destDSN := (*args)[1]
+
+	destIsPath := strings.HasPrefix(destDSN, "file:")
 
 	// lookup connection information in the users config file
 	// for much easier and shorter (and probably safer) command usage
@@ -100,23 +109,25 @@ func main() {
 			sourceDSN = connectionToDSN(c)
 		}
 
-		if c, ok := connections[destDSN]; ok {
-			if c.SourceOnly {
-				panic(errors.Errorf("can't use %q as a destination per your config", destDSN))
-			}
+		if !destIsPath {
+			if c, ok := connections[destDSN]; ok {
+				if c.SourceOnly {
+					panic(errors.Errorf("can't use %q as a destination per your config", destDSN))
+				}
 
-			if c.Params == nil {
-				c.Params = make(map[string]string)
-			}
+				if c.Params == nil {
+					c.Params = make(map[string]string)
+				}
 
-			// we will disable foreign key checks on the destination
-			// since we are importing more than one table at a time,
-			// otherwise we *will* get errors about foreign key constraints
-			if _, ok := c.Params["foreign_key_checks"]; !ok {
-				c.Params["foreign_key_checks"] = "0"
-			}
+				// we will disable foreign key checks on the destination
+				// since we are importing more than one table at a time,
+				// otherwise we *will* get errors about foreign key constraints
+				if _, ok := c.Params["foreign_key_checks"]; !ok {
+					c.Params["foreign_key_checks"] = "0"
+				}
 
-			destDSN = connectionToDSN(c)
+				destDSN = connectionToDSN(c)
+			}
 		}
 	}
 
@@ -149,9 +160,56 @@ func main() {
 		}
 	}
 
-	dst, err := mysql.NewFromDSN(destDSN, destDSN)
-	if err != nil {
-		panic(err)
+	var dst *mysql.Database
+	if !destIsPath {
+		dst, err = mysql.NewFromDSN(destDSN, destDSN)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		name := strings.TrimPrefix(destDSN, "file:")
+
+		if _, err := os.Stat(name); err == nil {
+			incompleteName := name + ".incomplete"
+			oldName := name + ".old"
+			finalName := name
+			name = incompleteName
+			defer func() {
+				// if the "old" directory exists, we can remove it
+				if _, err := os.Stat(oldName); err == nil {
+					log.Println("removing", oldName)
+					if err := os.RemoveAll(oldName); err != nil {
+						panic(err)
+					}
+				}
+
+				// once we're done, we can rename the already existing directory to something else,
+				// so that we can rename our new directory to the correct name
+				log.Println("moving", finalName, "to", oldName)
+				if err := os.Rename(finalName, oldName); err != nil {
+					panic(err)
+				}
+
+				// and then we can rename our new directory to the correct name
+				log.Println("moving", name, "to", finalName)
+				if err := os.Rename(name, finalName); err != nil {
+					panic(err)
+				}
+
+				// and then we can remove the old directory
+				log.Println("removing", oldName)
+				if err := os.RemoveAll(oldName); err != nil {
+					panic(err)
+				}
+			}()
+		}
+
+		log.Println("writing to", name)
+
+		dst, err = mysql.NewLocalWriter(name)
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	dst.DisableUnusedColumnWarnings = true
@@ -185,7 +243,7 @@ func main() {
 	tables := make(chan string, len(*tableNames))
 	go func() {
 		defer close(tables)
-		err = src.Select(tables, "select`table_name`"+
+		err := src.Select(tables, "select`table_name`"+
 			"from`information_schema`.`TABLES`"+
 			"where`table_schema`=database()"+
 			"and`table_name`in(@@Tables)"+
@@ -200,9 +258,9 @@ func main() {
 
 	// our multi-progress bar ties right into our wait group
 	var wg sync.WaitGroup
-	var pb *mpb.Progress
-	if !*noProgress {
-		pb = mpb.New(mpb.WithWaitGroup(&wg))
+	var p *mpb.Progress
+	if !*noProgressBars {
+		p = mpb.New(mpb.WithWaitGroup(&wg))
 	}
 
 	// we need to delay some funcs, most notably the foreign key constraint part.
@@ -225,8 +283,31 @@ func main() {
 
 		wg.Add(1)
 
+		var bar *mpb.Bar
+		if !*noProgressBars {
+			// our pretty bar config for the progress bars
+			// their documentation lives over here https://github.com/vbauerster/mpb
+			bar = p.New(0,
+				mpb.BarStyle(),
+				mpb.PrependDecorators(
+					decor.Name(color.HiBlueString(tableName)),
+					decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
+				),
+				mpb.AppendDecorators(
+					decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", "),
+					decor.EwmaSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", 30),
+					decor.EwmaETA(decor.ET_STYLE_GO, 30),
+				),
+			)
+		}
+
 		go func() {
 			defer wg.Done()
+
+			dst := dst
+			if destIsPath {
+				dst = dst.WriterWithSubdir(filepath.Join("tables", tableName))
+			}
 
 			// once this function is done, let another task take a place
 			// in our guard
@@ -301,7 +382,7 @@ func main() {
 				// cool mysql insert func knows how to map the row values
 				tag := `mysql:"` + strings.ReplaceAll(c.ColumnName, `,`, `0x2C`) + `"`
 
-				var v interface{}
+				var v any
 
 				// the switch through data types (different than column types, doesn't include lengths)
 				// to determine the type of our struct field
@@ -385,15 +466,15 @@ func main() {
 				}()
 			}
 
-			var count struct {
-				Count int64
-			}
-			if !*skipData {
+			var count int64
+			if !*skipData && !*noProgressBars && !*skipCount {
 				// and get the count, so we can show are swick progress bars
-				err = src.Select(&count, "select count(*)`Count`from`"+tableName+"`", 0)
+				err := src.Select(&count, "select count(*)`Count`from`"+tableName+"`", 0)
 				if err != nil {
 					panic(err)
 				}
+
+				bar.SetTotal(count, false)
 			}
 
 			var tempTableName string
@@ -403,7 +484,7 @@ func main() {
 				var table struct {
 					CreateMySQL string `mysql:"Create Table"`
 				}
-				err = src.Select(&table, "show create table`"+tableName+"`", 0)
+				err := src.Select(&table, "show create table`"+tableName+"`", 0)
 				if err != nil {
 					panic(err)
 				}
@@ -448,22 +529,16 @@ func main() {
 
 				if !*dryRyn {
 					// now we can make the table on our destination
-					err = dst.Exec("CREATE TABLE `" + tempTableName + "`" + strings.TrimPrefix(table.CreateMySQL, "CREATE TABLE `"+tableName+"`"))
+					err := dst.Exec("CREATE TABLE `" + tempTableName + "`" + strings.TrimPrefix(table.CreateMySQL, "CREATE TABLE `"+tableName+"`"))
 					if err != nil {
 						panic(err)
 					}
 				}
 
 				delayedFuncs <- func() {
-					tx, cancel, err := dst.BeginTx()
-					defer cancel()
-					if err != nil {
-						panic(err)
-					}
-
 					// drop the old table now that our temp table is done
 					if !*dryRyn {
-						err = tx.Exec("drop table if exists`" + tableName + "`")
+						err := dst.Exec("drop table if exists`" + tableName + "`")
 						if err != nil {
 							panic(err)
 						}
@@ -477,7 +552,7 @@ func main() {
 					// if you're doing this live, there *is* some down time, but other tools handle this the same
 					// way, so I don't think it's unreasonable if we do the same
 					if !*dryRyn {
-						err = tx.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`")
+						err := dst.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`")
 						if err != nil {
 							panic(err)
 						}
@@ -487,7 +562,7 @@ func main() {
 					// converting our constraints to alter table syntax by removing our leading
 					// comma and adding the word "add" at the beginning of each line
 					if len(constraints) != 0 && !*dryRyn {
-						err = tx.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd"))
+						err := dst.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd"))
 						if err != nil {
 							panic(err)
 						}
@@ -501,7 +576,7 @@ func main() {
 					})
 					go func() {
 						defer close(triggers)
-						err = src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0)
+						err := src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0)
 						if err != nil {
 							panic(err)
 						}
@@ -521,36 +596,16 @@ func main() {
 						trigger.CreateMySQL = definerRegexp.ReplaceAllString(trigger.CreateMySQL, "")
 
 						if !*dryRyn {
-							err = tx.Exec(trigger.CreateMySQL)
+							err := dst.Exec(trigger.CreateMySQL)
 							if err != nil {
 								panic(err)
 							}
 						}
 					}
-
-					if err = tx.Commit(); err != nil {
-						panic(err)
-					}
 				}
 			}
 
-			var bar *mpb.Bar
-			if !*noProgress {
-				// our pretty bar config for the progress bars
-				// their documention lives over here https://github.com/vbauerster/mpb
-				bar = pb.AddBar(count.Count,
-					mpb.BarStyle("|▇▇ |"),
-					mpb.PrependDecorators(
-						decor.Name(color.HiBlueString(tableName)),
-						decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
-					),
-					mpb.AppendDecorators(
-						decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", ", decor.WCSyncWidth),
-						decor.AverageSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", decor.WCSyncWidth),
-						decor.AverageETA(decor.ET_STYLE_MMSS),
-					),
-				)
-			} else {
+			if *noProgressBars {
 				log.Println("importing", tableName)
 			}
 
@@ -561,10 +616,9 @@ func main() {
 				// channel we got from the select
 				inserter := dst.I()
 
-				if !*noProgress {
+				if !*noProgressBars {
 					inserter = inserter.SetAfterRowExec(func(start time.Time) {
-						bar.Increment()
-						bar.DecoratorEwmaUpdate(time.Since(start))
+						bar.EwmaIncrement(time.Since(start))
 					})
 				}
 
@@ -581,7 +635,7 @@ func main() {
 				}
 			}
 
-			if !*noProgress {
+			if !*noProgressBars {
 				// and just in case the rows have changed count since our count selection,
 				// we'll just tell the progress bar that we're finished
 				bar.SetTotal(bar.Current(), true)
@@ -589,8 +643,8 @@ func main() {
 		}()
 	}
 
-	if !*noProgress {
-		pb.Wait()
+	if !*noProgressBars {
+		p.Wait()
 	} else {
 		wg.Wait()
 	}
@@ -607,6 +661,11 @@ func main() {
 
 	if *funcs {
 		log.Println("importing functions...")
+
+		dst := dst
+		if destIsPath {
+			dst = dst.WriterWithSubdir("funcs")
+		}
 
 		var funcs []struct {
 			FuncName string `mysql:"ROUTINE_NAME"`
@@ -647,6 +706,11 @@ func main() {
 	if *views {
 		log.Println("importing views...")
 
+		dst := dst
+		if destIsPath {
+			dst = dst.WriterWithSubdir("views")
+		}
+
 		var views []struct {
 			ViewName string `mysql:"TABLE_NAME"`
 		}
@@ -685,6 +749,11 @@ func main() {
 
 	if *procs {
 		log.Println("importing stored procedures...")
+
+		dst := dst
+		if destIsPath {
+			dst = dst.WriterWithSubdir("procs")
+		}
 
 		var procs []struct {
 			ProcName string `mysql:"ROUTINE_NAME"`
