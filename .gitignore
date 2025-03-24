@@ -2,3 +2,5 @@ swoof
 .vscode/settings.json
 
 .DS_Store
+# Added by goreleaser init:
+dist/
