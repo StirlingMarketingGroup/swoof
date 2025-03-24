@@ -30,7 +30,9 @@ export PATH=$PATH:$GOPATH/bin
 ```
 
 ## Docker Alternative
+
 For those who use Docker for everything:
+
 ```shell
 docker build -t swoof .
 docker run --rm swoof [flags] [source] [destination]
