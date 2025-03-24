@@ -179,6 +179,8 @@ swoof -skip-count prod file:../dump users
 
 This will create a set of folders in the `../dump` including `../dump/tables/users/`, and inside that folder will be the `*.sql.gz` files for the table.
 
+![Local Backup Example](local-backup.png)
+
 ### Restoring
 
 At the time of writing, swoof doesn't have a restore feature, but the sql files are to be executed in numerical order, starting with the tables first, then any procs, views, and funcs. You should be able to use the following command to restore a specific table:
