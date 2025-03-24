@@ -186,7 +186,7 @@ This will create a set of folders in the `../dump` including `../dump/tables/use
 At the time of writing, swoof doesn't have a restore feature, but the sql files are to be executed in numerical order, starting with the tables first, then any procs, views, and funcs. You should be able to use the following command to restore a specific table:
 
 ```shell
-zcat users.sql.gz | mysql -u root -p cooldb
+zcat ../dump/tables/users/*.sql.gz | mysql -u username -p database_name
 ```
 
 Future versions of swoof may include a restore feature that will do this for you.
