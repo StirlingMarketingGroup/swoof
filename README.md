@@ -61,6 +61,8 @@ swoof [flags] production localhost table1 table2 table3
 - `-t` value
     max concurrent tables at the same time. Anything more than 4 seems to crash things, so YMMV (default 4)
 - `-v` writes all queries to stdout (default false)
+- `-no-progress` disables the progress bar (default false)
+- `-skip-count` skips the count query that is used to determine the number of rows in the table. This is useful when the table is very large and the count query is slow. (default false)
 
 ### Using a connections file
 
@@ -158,3 +160,31 @@ Default:       4194304
 Max packet size allowed in bytes. The default value is 4 MiB and should be adjusted to match the server settings. `maxAllowedPacket=0` can be used to automatically fetch the `max_allowed_packet` variable from server *on every connection*.
 
 You can read more about DSNs here <https://github.com/go-sql-driver/mysql#dsn-data-source-name>.
+
+## Local Backups
+
+Swoof can also be used as a local backup tool by writing `*.sql` files to a specified directory instead of exporting data to another database. This is particularly useful for creating backups that can be stored locally or transferred to external storage.
+
+Example:
+
+```shell
+swoof -skip-count prod file:../dump users
+```
+
+- `-skip-count` flag is used to skip the count query that is used to determine the number of rows in the table. This is useful when the table is very large and the count query is slow.
+- `prod` is the connection name in the `connections.yaml` file.
+- `file:../dump` is the directory where the `*.sql` files will be written.
+- `users` is the table name.
+- *.sql files will be written to `../dump/tables/users/` and will actually be `*.sql.gz` files to save space.
+
+This will create a set of folders in the `../dump` including `../dump/tables/users/`, and inside that folder will be the `*.sql.gz` files for the table.
+
+### Restoring
+
+At the time of writing, swoof doesn't have a restore feature, but the sql files are to be executed in numerical order, starting with the tables first, then any procs, views, and funcs. You should be able to use the following command to restore a specific table:
+
+```shell
+zcat users.sql.gz | mysql -u root -p cooldb
+```
+
+Future versions of swoof may include a restore feature that will do this for you.
