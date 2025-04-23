@@ -575,8 +575,7 @@ func main() {
 					if len(constraints) != 0 && !*dryRyn {
 						err := dst.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd"))
 						if err != nil {
-							slog.Error("failed to add constraints to table", "error", err, "tableName", tableName)
-							os.Exit(1)
+							slog.Warn("failed to add constraints to table", "error", err, "tableName", tableName)
 						}
 					}
 
