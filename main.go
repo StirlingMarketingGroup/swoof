@@ -2,7 +2,8 @@ package main
 
 import (
 	"encoding/json"
-	"log"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,9 +15,7 @@ import (
 
 	dynamicstruct "github.com/Ompluscator/dynamic-struct"
 	mysql "github.com/StirlingMarketingGroup/cool-mysql"
-	"github.com/dustin/go-humanize/english"
 	"github.com/fatih/color"
-	"github.com/pkg/errors"
 	"github.com/posener/cmd"
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
@@ -103,7 +102,8 @@ func main() {
 	if connections, err := getConnections(*connectionsFile); err == nil {
 		if c, ok := connections[sourceDSN]; ok {
 			if c.DestOnly {
-				panic(errors.Errorf("can't use %q as a source per your config", sourceDSN))
+				slog.Error("source use is not allowed by config", "source", sourceDSN)
+				os.Exit(1)
 			}
 
 			sourceDSN = connectionToDSN(c)
@@ -112,7 +112,8 @@ func main() {
 		if !destIsPath {
 			if c, ok := connections[destDSN]; ok {
 				if c.SourceOnly {
-					panic(errors.Errorf("can't use %q as a destination per your config", destDSN))
+					slog.Error("destination use is not allowed by config", "destination", destDSN)
+					os.Exit(1)
 				}
 
 				if c.Params == nil {
@@ -138,14 +139,15 @@ func main() {
 	// this is where our rows are coming from
 	src, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
 	if err != nil {
-		panic(err)
+		slog.Error("failed to create source connection", "error", err, "sourceDSN", sourceDSN)
+		os.Exit(1)
 	}
 
 	src.DisableUnusedColumnWarnings = true
 
 	if *verbose {
 		src.Log = func(detail mysql.LogDetail) {
-			log.Println(blue("src:"), detail.Query)
+			slog.Info(fmt.Sprintf("%s %s", blue("src:"), detail.Query))
 		}
 	}
 
@@ -154,17 +156,14 @@ func main() {
 		if logFnSrc != nil {
 			logFnSrc(detail)
 		}
-
-		if detail.Error != nil {
-			panic(detail.Error)
-		}
 	}
 
 	var dst *mysql.Database
 	if !destIsPath {
 		dst, err = mysql.NewFromDSN(destDSN, destDSN)
 		if err != nil {
-			panic(err)
+			slog.Error("failed to create destination connection", "error", err, "destinationDSN", destDSN)
+			os.Exit(1)
 		}
 	} else {
 		name := strings.TrimPrefix(destDSN, "file:")
@@ -177,38 +176,43 @@ func main() {
 			defer func() {
 				// if the "old" directory exists, we can remove it
 				if _, err := os.Stat(oldName); err == nil {
-					log.Println("removing", oldName)
+					slog.Info("removing old directory", "directory", oldName)
 					if err := os.RemoveAll(oldName); err != nil {
-						panic(err)
+						slog.Error("failed to remove old directory", "error", err, "directory", oldName)
+						os.Exit(1)
 					}
 				}
 
 				// once we're done, we can rename the already existing directory to something else,
 				// so that we can rename our new directory to the correct name
-				log.Println("moving", finalName, "to", oldName)
+				slog.Info("moving directory", "from", finalName, "to", oldName)
 				if err := os.Rename(finalName, oldName); err != nil {
-					panic(err)
+					slog.Error("failed to rename directory", "error", err, "from", finalName, "to", oldName)
+					os.Exit(1)
 				}
 
 				// and then we can rename our new directory to the correct name
-				log.Println("moving", name, "to", finalName)
+				slog.Info("moving directory", "from", name, "to", finalName)
 				if err := os.Rename(name, finalName); err != nil {
-					panic(err)
+					slog.Error("failed to rename directory", "error", err, "from", name, "to", finalName)
+					os.Exit(1)
 				}
 
 				// and then we can remove the old directory
-				log.Println("removing", oldName)
+				slog.Info("removing old directory", "directory", oldName)
 				if err := os.RemoveAll(oldName); err != nil {
-					panic(err)
+					slog.Error("failed to remove old directory", "error", err, "directory", oldName)
+					os.Exit(1)
 				}
 			}()
 		}
 
-		log.Println("writing to", name)
+		slog.Info("writing to file", "name", name)
 
 		dst, err = mysql.NewLocalWriter(name)
 		if err != nil {
-			panic(err)
+			slog.Error("failed to create local writer", "error", err, "name", name)
+			os.Exit(1)
 		}
 	}
 
@@ -216,7 +220,7 @@ func main() {
 
 	if *verbose {
 		dst.Log = func(detail mysql.LogDetail) {
-			log.Println(red("dst:"), detail.Query)
+			slog.Info(fmt.Sprintf("%s %s", red("dst:"), detail.Query))
 		}
 	}
 
@@ -225,15 +229,12 @@ func main() {
 		if logFnDst != nil {
 			logFnDst(detail)
 		}
-
-		if detail.Error != nil {
-			panic(detail.Error)
-		}
 	}
 
 	tableNames, err := getTables(*aliasesFiles, *all, args, src)
 	if err != nil {
-		panic(err)
+		slog.Error("failed to get tables", "error", err, "aliasesFile", *aliasesFiles, "all", *all, "args", *args)
+		os.Exit(1)
 	}
 
 	// and now we can get our tables ordered by the largest physical tables first
@@ -252,7 +253,8 @@ func main() {
 			"Tables": *tableNames,
 		})
 		if err != nil {
-			panic(err)
+			slog.Error("failed to select tables", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -338,7 +340,8 @@ func main() {
 					"and`table_name`='"+tableName+"'"+
 					"order by`ORDINAL_POSITION`", 0)
 				if err != nil {
-					panic(err)
+					slog.Error("failed to select columns", "error", err, "tableName", tableName)
+					os.Exit(1)
 				}
 			}()
 
@@ -435,7 +438,8 @@ func main() {
 				case "set":
 					v = new(any)
 				default:
-					panic(errors.Errorf("unknown mysql column of type %q", c.ColumnType))
+					slog.Error("unknown mysql column type", "columnType", c.ColumnType, "columnName", c.ColumnName, "tableName", tableName)
+					os.Exit(1)
 				}
 
 				rowStruct.AddField(f, v, tag)
@@ -461,7 +465,8 @@ func main() {
 
 					err := src.Select(ch, "select /*+ MAX_EXECUTION_TIME(2147483647) */ "+columnsQuoted+"from`"+tableName+"`", 0)
 					if err != nil {
-						panic(err)
+						slog.Error("failed to select rows", "error", err, "tableName", tableName, "columnsQuoted", columnsQuoted)
+						os.Exit(1)
 					}
 				}()
 			}
@@ -471,7 +476,8 @@ func main() {
 				// and get the count, so we can show are swick progress bars
 				err := src.Select(&count, "select count(*)`Count`from`"+tableName+"`", 0)
 				if err != nil {
-					panic(err)
+					slog.Error("failed to get row count", "error", err, "tableName", tableName)
+					os.Exit(1)
 				}
 
 				bar.SetTotal(count, false)
@@ -486,7 +492,8 @@ func main() {
 				}
 				err := src.Select(&table, "show create table`"+tableName+"`", 0)
 				if err != nil {
-					panic(err)
+					slog.Error("failed to select table creation syntax", "error", err, "tableName", tableName)
+					os.Exit(1)
 				}
 
 				tempTableName = *tempTablePrefix + tableName
@@ -495,7 +502,8 @@ func main() {
 					// delete the table from our destination
 					err = dst.Exec("drop table if exists`" + tempTableName + "`")
 					if err != nil {
-						panic(err)
+						slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
+						os.Exit(1)
 					}
 				}
 
@@ -531,7 +539,8 @@ func main() {
 					// now we can make the table on our destination
 					err := dst.Exec("CREATE TABLE `" + tempTableName + "`" + strings.TrimPrefix(table.CreateMySQL, "CREATE TABLE `"+tableName+"`"))
 					if err != nil {
-						panic(err)
+						slog.Error("failed to create table on destination", "error", err, "tableName", tempTableName)
+						os.Exit(1)
 					}
 				}
 
@@ -540,7 +549,8 @@ func main() {
 					if !*dryRyn {
 						err := dst.Exec("drop table if exists`" + tableName + "`")
 						if err != nil {
-							panic(err)
+							slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
+							os.Exit(1)
 						}
 					}
 
@@ -554,7 +564,8 @@ func main() {
 					if !*dryRyn {
 						err := dst.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`")
 						if err != nil {
-							panic(err)
+							slog.Error("failed to rename table", "error", err, "from", tempTableName, "to", tableName)
+							os.Exit(1)
 						}
 					}
 
@@ -564,7 +575,8 @@ func main() {
 					if len(constraints) != 0 && !*dryRyn {
 						err := dst.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd"))
 						if err != nil {
-							panic(err)
+							slog.Error("failed to add constraints to table", "error", err, "tableName", tableName)
+							os.Exit(1)
 						}
 					}
 
@@ -578,7 +590,8 @@ func main() {
 						defer close(triggers)
 						err := src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0)
 						if err != nil {
-							panic(err)
+							slog.Error("failed to select triggers", "error", err, "tableName", tableName)
+							os.Exit(1)
 						}
 					}()
 					for r := range triggers {
@@ -587,7 +600,8 @@ func main() {
 						}
 						err := src.Select(&trigger, "show create trigger`"+r.Trigger+"`", 0)
 						if err != nil {
-							panic(err)
+							slog.Error("failed to select trigger creation syntax", "error", err, "trigger", r.Trigger, "tableName", tableName)
+							os.Exit(1)
 						}
 
 						// we need to remove the definer from the trigger
@@ -598,7 +612,8 @@ func main() {
 						if !*dryRyn {
 							err := dst.Exec(trigger.CreateMySQL)
 							if err != nil {
-								panic(err)
+								slog.Error("failed to execute trigger creation SQL", "error", err, "trigger", r.Trigger, "tableName", tableName)
+								os.Exit(1)
 							}
 						}
 					}
@@ -606,7 +621,7 @@ func main() {
 			}
 
 			if *noProgressBars {
-				log.Println("importing", tableName)
+				slog.Info("importing table", "tableName", tableName)
 			}
 
 			if !*skipData && !*dryRyn {
@@ -625,12 +640,14 @@ func main() {
 				if !*insertIgnoreInto {
 					err = inserter.Insert("insert into`"+tempTableName+"`", ch)
 					if err != nil {
-						panic(err)
+						slog.Error("failed to insert rows into destination", "error", err, "tableName", tableName)
+						os.Exit(1)
 					}
 				} else {
 					err = inserter.Insert("insert ignore into`"+tableName+"`", ch)
 					if err != nil {
-						panic(err)
+						slog.Error("failed to insert rows into destination", "error", err, "tableName", tableName)
+						os.Exit(1)
 					}
 				}
 			}
@@ -652,7 +669,7 @@ func main() {
 	if !*insertIgnoreInto {
 		close(delayedFuncs)
 
-		log.Println("finalizing table imports...")
+		slog.Info("finalizing table imports...")
 
 		for f := range delayedFuncs {
 			f()
@@ -660,7 +677,7 @@ func main() {
 	}
 
 	if *funcs {
-		log.Println("importing functions...")
+		slog.Info("importing functions...")
 
 		dst := dst
 		if destIsPath {
@@ -675,7 +692,8 @@ func main() {
 			"where`ROUTINE_SCHEMA`=database()"+
 			"and`ROUTINE_TYPE`='FUNCTION'", 0)
 		if err != nil {
-			panic(err)
+			slog.Error("failed to select functions", "error", err)
+			os.Exit(1)
 		}
 
 		for _, f := range funcs {
@@ -684,27 +702,30 @@ func main() {
 			}
 			err = src.Select(&funcInfo, "show create function`"+f.FuncName+"`", 0)
 			if err != nil {
-				panic(err)
+				slog.Error("failed to select function creation syntax", "error", err, "functionName", f.FuncName)
+				os.Exit(1)
 			}
 
 			if !*dryRyn {
 				err = dst.Exec("drop function if exists`" + f.FuncName + "`")
 				if err != nil {
-					panic(err)
+					slog.Error("failed to drop function", "error", err, "functionName", f.FuncName)
+					os.Exit(1)
 				}
 
 				funcInfo.CreateMySQL = definerRegexp.ReplaceAllString(funcInfo.CreateMySQL, "")
 
 				err = dst.Exec(funcInfo.CreateMySQL)
 				if err != nil {
-					panic(err)
+					slog.Error("failed to execute function creation SQL", "error", err, "functionName", f.FuncName)
+					os.Exit(1)
 				}
 			}
 		}
 	}
 
 	if *views {
-		log.Println("importing views...")
+		slog.Info("importing views...")
 
 		dst := dst
 		if destIsPath {
@@ -719,7 +740,8 @@ func main() {
 			"where`TABLE_SCHEMA`=database()"+
 			"and`TABLE_TYPE`='VIEW'", 0)
 		if err != nil {
-			panic(err)
+			slog.Error("failed to select views", "error", err)
+			os.Exit(1)
 		}
 
 		for _, v := range views {
@@ -728,27 +750,30 @@ func main() {
 			}
 			err = src.Select(&view, "show create view`"+v.ViewName+"`", 0)
 			if err != nil {
-				panic(err)
+				slog.Error("failed to select view creation syntax", "error", err, "viewName", v.ViewName)
+				os.Exit(1)
 			}
 
 			if !*dryRyn {
 				err = dst.Exec("drop view if exists`" + v.ViewName + "`")
 				if err != nil {
-					panic(err)
+					slog.Error("failed to drop view", "error", err, "viewName", v.ViewName)
+					os.Exit(1)
 				}
 
 				view.CreateMySQL = definerRegexp.ReplaceAllString(view.CreateMySQL, "")
 
 				err = dst.Exec(view.CreateMySQL)
 				if err != nil {
-					panic(err)
+					slog.Error("failed to execute view creation SQL", "error", err, "viewName", v.ViewName)
+					os.Exit(1)
 				}
 			}
 		}
 	}
 
 	if *procs {
-		log.Println("importing stored procedures...")
+		slog.Info("importing stored procedures...")
 
 		dst := dst
 		if destIsPath {
@@ -763,7 +788,8 @@ func main() {
 			"where`ROUTINE_SCHEMA`=database()"+
 			"and`ROUTINE_TYPE`='PROCEDURE'", 0)
 		if err != nil {
-			panic(err)
+			slog.Error("failed to select stored procedures", "error", err)
+			os.Exit(1)
 		}
 
 		for _, p := range procs {
@@ -772,24 +798,27 @@ func main() {
 			}
 			err = src.Select(&procInfo, "show create procedure`"+p.ProcName+"`", 0)
 			if err != nil {
-				panic(err)
+				slog.Error("failed to select stored procedure creation syntax", "error", err, "procedureName", p.ProcName)
+				os.Exit(1)
 			}
 
 			if !*dryRyn {
 				err = dst.Exec("drop procedure if exists`" + p.ProcName + "`")
 				if err != nil {
-					panic(err)
+					slog.Error("failed to drop procedure", "error", err, "procedureName", p.ProcName)
+					os.Exit(1)
 				}
 
 				procInfo.CreateMySQL = definerRegexp.ReplaceAllString(procInfo.CreateMySQL, "")
 
 				err = dst.Exec(procInfo.CreateMySQL)
 				if err != nil {
-					panic(err)
+					slog.Error("failed to execute stored procedure creation SQL", "error", err, "procedureName", p.ProcName)
+					os.Exit(1)
 				}
 			}
 		}
 	}
 
-	log.Println("finished importing", tableCount, english.PluralWord(tableCount, "table", ""), "in", time.Since(start))
+	slog.Info("finished importing tables", "count", tableCount, "duration", time.Since(start))
 }
