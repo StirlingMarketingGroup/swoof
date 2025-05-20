@@ -214,6 +214,7 @@ func main() {
 		}
 	} else if destIsClipboard {
 		clipboardBuf = new(bytes.Buffer)
+		clipboardBuf.WriteString("set foreign_key_checks=0;\n\n")
 
 		dst, err = mysql.NewWriter(clipboardBuf)
 		if err != nil {
@@ -259,7 +260,7 @@ func main() {
 		err := src.Select(tables, "select`table_name`"+
 			"from`information_schema`.`TABLES`"+
 			"where`table_schema`=database()"+
-			"and`table_name`in(@@Tables)"+
+			"and`table_name`in({{ range $i, $table := .Tables }}{{ if $i }},{{ end }}{{ $table | printf `'%s'` }}{{ end }})"+
 			"and`table_type`='BASE TABLE'"+
 			"order by`data_length`+`index_length`desc", 0, mysql.Params{
 			"Tables": *tableNames,
@@ -832,6 +833,8 @@ func main() {
 	}
 
 	if destIsClipboard {
+		clipboardBuf.WriteString("set foreign_key_checks=1;\n")
+
 		err := clipboard.Init()
 		if err != nil {
 			slog.Error("failed to initialize clipboard", "error", err)
