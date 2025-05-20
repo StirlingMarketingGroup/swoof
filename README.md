@@ -163,6 +163,22 @@ Max packet size allowed in bytes. The default value is 4 MiB and should be adjus
 
 You can read more about DSNs here <https://github.com/go-sql-driver/mysql#dsn-data-source-name>.
 
+## Copy to Clipboard
+
+Swoof can also export SQL directly to your system clipboard by using clipboard as the destination:
+
+```shell
+swoof -n prod clipboard users
+```
+
+This works like a file export but writes the SQL output to your clipboard instead of the filesystem. It's useful for quickly inspecting or pasting table contents elsewhere without creating intermediate files.
+
+- The clipboard integration uses golang.design/x/clipboard, which supports macOS, Windows, and Linux (with X11 or Wayland).
+- The output is uncompressed plain SQL.
+- Only one table at a time is supported when clipboard is the destination.
+
+Notice that the `-n` flag is used to skip the data import, so you can use this to get the table structure without the data.
+
 ## Local Backups
 
 Swoof can also be used as a local backup tool by writing `*.sql` files to a specified directory instead of exporting data to another database. This is particularly useful for creating backups that can be stored locally or transferred to external storage.
