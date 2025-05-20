@@ -6,12 +6,13 @@ toolchain go1.24.2
 
 require (
 	github.com/Ompluscator/dynamic-struct v1.3.0
-	github.com/StirlingMarketingGroup/cool-mysql v0.0.2
+	github.com/StirlingMarketingGroup/cool-mysql v0.0.3
 	github.com/fatih/color v1.18.0
 	github.com/go-sql-driver/mysql v1.7.1
 	github.com/pkg/errors v0.9.1
 	github.com/posener/cmd v1.3.4
 	github.com/vbauerster/mpb/v8 v8.10.1
+	golang.design/x/clipboard v0.7.0
 	gopkg.in/yaml.v2 v2.4.0
 )
 
@@ -40,6 +41,9 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.26.0 // indirect
 	golang.org/x/crypto v0.35.0 // indirect
+	golang.org/x/exp v0.0.0-20190731235908-ec7cb31e5a56 // indirect
+	golang.org/x/image v0.6.0 // indirect
+	golang.org/x/mobile v0.0.0-20230301163155-e0f57694e12c // indirect
 	golang.org/x/sync v0.13.0 // indirect
 	golang.org/x/sys v0.33.0 // indirect
 )

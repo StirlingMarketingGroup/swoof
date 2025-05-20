@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"github.com/posener/cmd"
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
+	"golang.design/x/clipboard"
 )
 
 var confDir, _ = os.UserConfigDir()
@@ -96,6 +98,7 @@ func main() {
 	destDSN := (*args)[1]
 
 	destIsPath := strings.HasPrefix(destDSN, "file:")
+	destIsClipboard := strings.EqualFold(destDSN, "clipboard")
 
 	// lookup connection information in the users config file
 	// for much easier and shorter (and probably safer) command usage
@@ -109,7 +112,7 @@ func main() {
 			sourceDSN = connectionToDSN(c)
 		}
 
-		if !destIsPath {
+		if !destIsPath && !destIsClipboard {
 			if c, ok := connections[destDSN]; ok {
 				if c.SourceOnly {
 					slog.Error("destination use is not allowed by config", "destination", destDSN)
@@ -159,13 +162,8 @@ func main() {
 	}
 
 	var dst *mysql.Database
-	if !destIsPath {
-		dst, err = mysql.NewFromDSN(destDSN, destDSN)
-		if err != nil {
-			slog.Error("failed to create destination connection", "error", err, "destinationDSN", destDSN)
-			os.Exit(1)
-		}
-	} else {
+	var clipboardBuf *bytes.Buffer
+	if destIsPath {
 		name := strings.TrimPrefix(destDSN, "file:")
 
 		if _, err := os.Stat(name); err == nil {
@@ -212,6 +210,20 @@ func main() {
 		dst, err = mysql.NewLocalWriter(name)
 		if err != nil {
 			slog.Error("failed to create local writer", "error", err, "name", name)
+			os.Exit(1)
+		}
+	} else if destIsClipboard {
+		clipboardBuf = new(bytes.Buffer)
+
+		dst, err = mysql.NewWriter(clipboardBuf)
+		if err != nil {
+			slog.Error("failed to create writer", "error", err)
+			os.Exit(1)
+		}
+	} else {
+		dst, err = mysql.NewFromDSN(destDSN, destDSN)
+		if err != nil {
+			slog.Error("failed to create destination connection", "error", err, "destinationDSN", destDSN)
 			os.Exit(1)
 		}
 	}
@@ -817,6 +829,18 @@ func main() {
 				}
 			}
 		}
+	}
+
+	if destIsClipboard {
+		err := clipboard.Init()
+		if err != nil {
+			slog.Error("failed to initialize clipboard", "error", err)
+			os.Exit(1)
+		}
+
+		clipboard.Write(clipboard.FmtText, clipboardBuf.Bytes())
+
+		slog.Info("copied to clipboard", "size", len(clipboardBuf.Bytes()))
 	}
 
 	slog.Info("finished importing tables", "count", tableCount, "duration", time.Since(start))
