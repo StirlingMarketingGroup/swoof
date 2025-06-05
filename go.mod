@@ -11,7 +11,7 @@ require (
 	github.com/go-sql-driver/mysql v1.7.1
 	github.com/pkg/errors v0.9.1
 	github.com/posener/cmd v1.3.4
-	github.com/vbauerster/mpb/v8 v8.10.1
+	github.com/vbauerster/mpb/v8 v8.10.2
 	golang.design/x/clipboard v0.7.0
 	gopkg.in/yaml.v2 v2.4.0
 )
