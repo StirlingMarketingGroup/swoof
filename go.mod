@@ -8,7 +8,7 @@ require (
 	github.com/Ompluscator/dynamic-struct v1.3.0
 	github.com/StirlingMarketingGroup/cool-mysql v0.0.6
 	github.com/fatih/color v1.18.0
-	github.com/go-sql-driver/mysql v1.7.1
+	github.com/go-sql-driver/mysql v1.9.3
 	github.com/pkg/errors v0.9.1
 	github.com/posener/cmd v1.3.4
 	github.com/vbauerster/mpb/v8 v8.10.2
@@ -18,6 +18,7 @@ require (
 
 require (
 	cloud.google.com/go v0.115.1 // indirect
+	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/VividCortex/ewma v1.2.0 // indirect
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
 	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf // indirect
