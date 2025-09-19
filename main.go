@@ -169,10 +169,10 @@ func ensureSemverPrefix(v string) string {
 	if v == "" {
 		return v
 	}
-	if strings.HasPrefix(v, "v") {
+	switch v[0] {
+	case 'v':
 		return v
-	}
-	if strings.HasPrefix(v, "V") {
+	case 'V':
 		return "v" + v[1:]
 	}
 	return "v" + v
