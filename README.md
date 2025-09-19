@@ -1,5 +1,10 @@
 # Swoof
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/StirlingMarketingGroup/swoof.svg)](https://pkg.go.dev/github.com/StirlingMarketingGroup/swoof)
+[![Go Report Card](https://goreportcard.com/badge/github.com/StirlingMarketingGroup/swoof)](https://goreportcard.com/report/github.com/StirlingMarketingGroup/swoof)
+[![Release](https://img.shields.io/github/v/release/StirlingMarketingGroup/swoof?logo=github)](https://github.com/StirlingMarketingGroup/swoof/releases)
+[![Go Version](https://img.shields.io/badge/go-1.24+-00ADD8?logo=go)](https://go.dev/dl/)
+
 Just swoof it in. Ultra fast MySQL table importer.
 
 ![Swoof](swoof.gif)
@@ -47,6 +52,16 @@ swoof [flags] 'user:pass@(host)/dbname' 'user:pass@(host)/dbname' table1 table2 
 # or, with a connections file
 swoof [flags] production localhost table1 table2 table3
 ```
+
+### Wildcard tables
+
+Table arguments accept glob patterns, so you can target batches without typing each name. Wrap the pattern in quotes so your shell does not expand it locally. `*` matches any number of characters, `?` matches a single character, and patterns are resolved against base tables on the source connection.
+
+```shell
+swoof production localhost 'reports_*' 'audit_20??'
+```
+
+If a pattern does not match anything, `swoof` stops with an error rather than silently continuing.
 
 ### Flags
 
