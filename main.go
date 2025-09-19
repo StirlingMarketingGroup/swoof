@@ -25,6 +25,7 @@ import (
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
 	"golang.design/x/clipboard"
+	"golang.org/x/mod/semver"
 )
 
 const modulePath = "github.com/StirlingMarketingGroup/swoof"
@@ -88,10 +89,7 @@ func maybeReportNewVersion() {
 		return
 	}
 
-	currentForQuery := current
-	if !strings.HasPrefix(currentForQuery, "v") {
-		currentForQuery = "v" + currentForQuery
-	}
+	currentSemver := ensureSemverPrefix(current)
 
 	goBin, err := exec.LookPath("go")
 	if err != nil {
@@ -101,7 +99,7 @@ func maybeReportNewVersion() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, goBin, "list", "-m", "-u", "-json", fmt.Sprintf("%s@%s", module, currentForQuery))
+	cmd := exec.CommandContext(ctx, goBin, "list", "-m", "-u", "-json", fmt.Sprintf("%s@%s", module, currentSemver))
 	cmd.Dir = os.TempDir()
 	cmd.Env = append(os.Environ(), "GO111MODULE=on", "GOWORK=off")
 	cmd.Stderr = io.Discard
@@ -125,46 +123,12 @@ func maybeReportNewVersion() {
 	}
 
 	latestRaw := info.Update.Version
-	latest := strings.TrimPrefix(latestRaw, "v")
-	currentTrimmed := strings.TrimPrefix(current, "v")
-
-	if !isNewerVersion(latest, currentTrimmed) {
+	if !isNewerVersion(latestRaw, current) {
 		return
 	}
 
 	label := color.New(color.FgHiYellow).Sprint("⚠ update available")
 	fmt.Fprintf(os.Stderr, "%s: swoof %s is available (current %s). https://github.com/StirlingMarketingGroup/swoof/releases/latest\n", label, latestRaw, current)
-}
-
-func isNewerVersion(latest, current string) bool {
-	latestParts, lok := versionParts(latest)
-	currentParts, cok := versionParts(current)
-	if !lok || !cok {
-		return false
-	}
-
-	length := len(latestParts)
-	if len(currentParts) > length {
-		length = len(currentParts)
-	}
-
-	for i := 0; i < length; i++ {
-		var latestVal, currentVal int
-		if i < len(latestParts) {
-			latestVal = latestParts[i]
-		}
-		if i < len(currentParts) {
-			currentVal = currentParts[i]
-		}
-		if latestVal > currentVal {
-			return true
-		}
-		if latestVal < currentVal {
-			return false
-		}
-	}
-
-	return false
 }
 
 func moduleVersion() (string, string) {
@@ -189,24 +153,29 @@ func moduleVersion() (string, string) {
 	return module, info.Main.Version
 }
 
-func versionParts(v string) ([]int, bool) {
-	segments := strings.Split(v, ".")
-	parts := make([]int, len(segments))
-	for i, seg := range segments {
-		seg = strings.TrimSpace(seg)
-		if seg == "" {
-			return nil, false
-		}
-		if dash := strings.Index(seg, "-"); dash != -1 {
-			seg = seg[:dash]
-		}
-		n, err := strconv.Atoi(seg)
-		if err != nil {
-			return nil, false
-		}
-		parts[i] = n
+func isNewerVersion(latest, current string) bool {
+	latestSemver := ensureSemverPrefix(latest)
+	currentSemver := ensureSemverPrefix(current)
+
+	if !semver.IsValid(latestSemver) || !semver.IsValid(currentSemver) {
+		return false
 	}
-	return parts, true
+
+	return semver.Compare(latestSemver, currentSemver) > 0
+}
+
+func ensureSemverPrefix(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return v
+	}
+	if strings.HasPrefix(v, "v") {
+		return v
+	}
+	if strings.HasPrefix(v, "V") {
+		return "v" + v[1:]
+	}
+	return "v" + v
 }
 
 func main() {
