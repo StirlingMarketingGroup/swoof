@@ -2,13 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,7 +27,12 @@ import (
 	"golang.design/x/clipboard"
 )
 
-var confDir, _ = os.UserConfigDir()
+const modulePath = "github.com/StirlingMarketingGroup/swoof"
+
+var (
+	version    = ""
+	confDir, _ = os.UserConfigDir()
+)
 
 var (
 	root = cmd.New()
@@ -70,12 +79,144 @@ var (
 
 var definerRegexp = regexp.MustCompile(`\sDEFINER\s*=\s*[^ ]+`)
 
+func maybeReportNewVersion() {
+	module, current := moduleVersion()
+	if module == "" || current == "" {
+		return
+	}
+	if strings.Contains(strings.ToLower(current), "dev") {
+		return
+	}
+
+	currentForQuery := current
+	if !strings.HasPrefix(currentForQuery, "v") {
+		currentForQuery = "v" + currentForQuery
+	}
+
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, goBin, "list", "-m", "-u", "-json", fmt.Sprintf("%s@%s", module, currentForQuery))
+	cmd.Dir = os.TempDir()
+	cmd.Env = append(os.Environ(), "GO111MODULE=on", "GOWORK=off")
+	cmd.Stderr = io.Discard
+
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	var info struct {
+		Update *struct {
+			Version string `json:"Version"`
+		} `json:"Update"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil {
+		return
+	}
+
+	if info.Update == nil || info.Update.Version == "" {
+		return
+	}
+
+	latestRaw := info.Update.Version
+	latest := strings.TrimPrefix(latestRaw, "v")
+	currentTrimmed := strings.TrimPrefix(current, "v")
+
+	if !isNewerVersion(latest, currentTrimmed) {
+		return
+	}
+
+	label := color.New(color.FgHiYellow).Sprint("⚠ update available")
+	fmt.Fprintf(os.Stderr, "%s: swoof %s is available (current %s). https://github.com/StirlingMarketingGroup/swoof/releases/latest\n", label, latestRaw, current)
+}
+
+func isNewerVersion(latest, current string) bool {
+	latestParts, lok := versionParts(latest)
+	currentParts, cok := versionParts(current)
+	if !lok || !cok {
+		return false
+	}
+
+	length := len(latestParts)
+	if len(currentParts) > length {
+		length = len(currentParts)
+	}
+
+	for i := 0; i < length; i++ {
+		var latestVal, currentVal int
+		if i < len(latestParts) {
+			latestVal = latestParts[i]
+		}
+		if i < len(currentParts) {
+			currentVal = currentParts[i]
+		}
+		if latestVal > currentVal {
+			return true
+		}
+		if latestVal < currentVal {
+			return false
+		}
+	}
+
+	return false
+}
+
+func moduleVersion() (string, string) {
+	if version != "" {
+		return modulePath, version
+	}
+
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return modulePath, ""
+	}
+
+	module := info.Main.Path
+	if module == "" {
+		module = modulePath
+	}
+
+	if info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return module, ""
+	}
+
+	return module, info.Main.Version
+}
+
+func versionParts(v string) ([]int, bool) {
+	segments := strings.Split(v, ".")
+	parts := make([]int, len(segments))
+	for i, seg := range segments {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			return nil, false
+		}
+		if dash := strings.Index(seg, "-"); dash != -1 {
+			seg = seg[:dash]
+		}
+		n, err := strconv.Atoi(seg)
+		if err != nil {
+			return nil, false
+		}
+		parts[i] = n
+	}
+	return parts, true
+}
+
 func main() {
 	start := time.Now()
 
 	// parse our command line arguments and make sure we
 	// were given something that makes sense
 	root.ParseArgs(os.Args...)
+
+	maybeReportNewVersion()
 
 	if len(*args) < 2 {
 		root.Usage()
