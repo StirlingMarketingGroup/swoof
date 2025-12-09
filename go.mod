@@ -13,7 +13,7 @@ require (
 	github.com/posener/cmd v1.3.4
 	github.com/vbauerster/mpb/v8 v8.11.2
 	golang.design/x/clipboard v0.7.1
-	golang.org/x/mod v0.30.0
+	golang.org/x/mod v0.31.0
 	gopkg.in/yaml.v2 v2.4.0
 )
 
