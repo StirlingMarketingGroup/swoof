@@ -7,8 +7,8 @@ github.com/DATA-DOG/go-sqlmock v1.5.2 h1:OcvFkGmslmlZibjAjaHm3L//6LiuBgolP7Oputl
 github.com/DATA-DOG/go-sqlmock v1.5.2/go.mod h1:88MAG/4G7SMwSE3CeA0ZKzrT5CiOU3OJ+JlNzwDqpNU=
 github.com/Ompluscator/dynamic-struct v1.3.0 h1:Ozvw+T2UOmV/2J2/L7tPZxrypKen3CGSBwmWj8pwC4Q=
 github.com/Ompluscator/dynamic-struct v1.3.0/go.mod h1:01g22H1GC9IFcrpQ4JQBkzynp8RoT0wmUMx/OvXNnw8=
-github.com/StirlingMarketingGroup/cool-mysql v0.0.15 h1:Q4bkHj0XRgw4lQOIX11dm5yv7NeY0i9YOaBbONz0akY=
-github.com/StirlingMarketingGroup/cool-mysql v0.0.15/go.mod h1:xvnFWaAdXLfTXQ6moVcgwFVea1AV+9yif2YmRVXrJyg=
+github.com/StirlingMarketingGroup/cool-mysql v0.0.18 h1:N9wrzbVM+f3AWWZWV72HKOnA0DTjvsQzRSkaeZq0xIc=
+github.com/StirlingMarketingGroup/cool-mysql v0.0.18/go.mod h1:NIxf8ZHZrI6gsQk6h5J+R2yUaU26AfYwrt8wh45PjzI=
 github.com/VividCortex/ewma v1.2.0 h1:f58SaIzcDXrSy3kWaHNvuJgJ3Nmz59Zji6XoJR/q1ow=
 github.com/VividCortex/ewma v1.2.0/go.mod h1:nz4BbCtbLyFDeC9SUHbtcT5644juEuWfUAUnGx7j5l4=
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d h1:licZJFw2RwpHMqeKTCYkitsPqHNxTmd4SNR5r94FGM8=

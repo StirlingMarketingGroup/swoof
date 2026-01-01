@@ -6,7 +6,7 @@ toolchain go1.24.2
 
 require (
 	github.com/Ompluscator/dynamic-struct v1.3.0
-	github.com/StirlingMarketingGroup/cool-mysql v0.0.15
+	github.com/StirlingMarketingGroup/cool-mysql v0.0.18
 	github.com/fatih/color v1.18.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/pkg/errors v0.9.1
