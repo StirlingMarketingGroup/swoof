@@ -541,7 +541,9 @@ func main() {
 					}
 				case "float":
 					v = new(float64)
-				case "decimal", "double":
+				case "double":
+					v = new(float64)
+				case "decimal", :
 					// our cool mysql literal is exactly what it sounds like;
 					// passed directly into the query with no escaping, which is know is
 					// safe here because a decimal from mysql can't contain breaking characters
