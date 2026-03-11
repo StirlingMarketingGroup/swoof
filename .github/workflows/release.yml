@@ -30,3 +30,13 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update install version in README
+        if: github.event_name == 'release'
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          sed -i "s|go install github.com/StirlingMarketingGroup/swoof@.*|go install github.com/StirlingMarketingGroup/swoof@${TAG}|" README.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --staged --quiet || git commit -m "Update install version to ${TAG}" && git push origin HEAD:master
