@@ -69,6 +69,8 @@ var (
 	// the rows to the source
 	rowBufferSize = root.Int("r", 10_000, "max rows buffer size. Will have this many rows downloaded and ready for importing")
 
+	whereClause = root.String("w", "", "optional WHERE clause to filter rows from the source table (e.g. \"ID > 1000\")")
+
 	tempTablePrefix = root.String("p", "_swoof_", "prefix of the temp table used for initial creation before the swap and drop")
 
 	args = root.Args("source, dest, tables", "source, dest, tables, ex:\n"+
@@ -586,7 +588,11 @@ func main() {
 				go func() {
 					defer chRef.Close()
 
-					err := src.Select(ch, "select /*+ MAX_EXECUTION_TIME(2147483647) */ "+columnsQuoted+"from`"+tableName+"`", 0)
+					q := "select /*+ MAX_EXECUTION_TIME(2147483647) */ " + columnsQuoted + "from`" + tableName + "`"
+					if *whereClause != "" {
+						q += " where " + *whereClause + " "
+					}
+					err := src.Select(ch, q, 0)
 					if err != nil {
 						slog.Error("failed to select rows", "error", err, "tableName", tableName, "columnsQuoted", columnsQuoted)
 						os.Exit(1)
@@ -597,7 +603,11 @@ func main() {
 			var count int64
 			if !*skipData && !*noProgressBars && !*skipCount {
 				// and get the count, so we can show are swick progress bars
-				err := src.Select(&count, "select count(*)`Count`from`"+tableName+"`", 0)
+				countQ := "select count(*)`Count`from`" + tableName + "`"
+				if *whereClause != "" {
+					countQ += " where " + *whereClause + " "
+				}
+				err := src.Select(&count, countQ, 0)
 				if err != nil {
 					slog.Error("failed to get row count", "error", err, "tableName", tableName)
 					os.Exit(1)
