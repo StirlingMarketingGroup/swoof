@@ -24,7 +24,7 @@ You will need Golang, which you can get from here <https://golang.org/doc/instal
 All you need to download, build, and install is the following command:
 
 ```shell
-go install github.com/StirlingMarketingGroup/swoof@latest
+go install github.com/StirlingMarketingGroup/swoof@v1.3.5
 ```
 
 If you already have `$GOPATH/bin` in your path, this should be all you need! If you don't though, you can add this to to your `~/.bashrc` or `~/.zshrc` or whatever file your shell runs on login.
@@ -63,6 +63,22 @@ swoof production localhost 'reports_*' 'audit_20??'
 
 If a pattern does not match anything, `swoof` stops with an error rather than silently continuing.
 
+### Filtering rows with WHERE
+
+The `-w` flag lets you filter which rows are copied from the source. This is useful for syncing targeted slices of very large tables without pulling everything.
+
+```shell
+# Only sync recent rows
+swoof prod localhost orders -w "Created > '2025-01-01'"
+
+# Sync rows referenced by a local table
+swoof prod localhost pagerequests -w "PageRequestID in (select PageRequestID from quoterequests)"
+```
+
+The full table structure (schema, triggers, constraints) is always synced — only the row data is filtered. The progress bar count also respects the filter.
+
+If you use `-w` with multiple tables, the same WHERE clause is applied to all of them, so make sure the referenced columns exist on each table.
+
 ### Flags
 
 - `-c` your connections file (default `~/.config/swoof/connections.yaml` on Linux, more info below)
@@ -78,6 +94,7 @@ If a pattern does not match anything, `swoof` stops with an error rather than si
 - `-t` value
     max concurrent tables at the same time. Anything more than 4 seems to crash things, so YMMV (default 4)
 - `-v` writes all queries to stdout (default false)
+- `-w` optional WHERE clause to filter rows from the source (e.g. `-w "Created > '2025-01-01'"`)
 - `-no-progress` disables the progress bar (default false)
 - `-skip-count` skips the count query that is used to determine the number of rows in the table. This is useful when the table is very large and the count query is slow. (default false)
 
