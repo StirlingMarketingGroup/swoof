@@ -12,10 +12,18 @@ jobs:
   goreleaser:
     runs-on: ubuntu-latest
     steps:
+      - id: smg-actions
+        uses: getsentry/action-github-app-token@v3
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
+          token: ${{ steps.smg-actions.outputs.token }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -33,10 +41,16 @@ jobs:
 
       - name: Update install version in README
         if: github.event_name == 'release'
+        env:
+          GITHUB_TOKEN: ${{ steps.smg-actions.outputs.token }}
         run: |
           TAG="${{ github.event.release.tag_name }}"
           sed -i "s|go install github.com/StirlingMarketingGroup/swoof@.*|go install github.com/StirlingMarketingGroup/swoof@${TAG}|" README.md
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "smg-actions[bot]"
+          git config user.email "smg-actions[bot]@users.noreply.github.com"
           git add README.md
-          git diff --staged --quiet || git commit -m "Update install version to ${TAG}" && git push origin HEAD:master
+          if ! git diff --staged --quiet; then
+            git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}
+            git commit -m "Update install version to ${TAG}"
+            git push origin HEAD:master
+          fi
