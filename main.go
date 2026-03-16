@@ -369,6 +369,9 @@ func main() {
 	tables := make(chan string, len(*tableNames))
 	go func() {
 		defer close(tables)
+		if len(*tableNames) == 0 {
+			return
+		}
 		err := src.Select(tables, "select`table_name`"+
 			"from`information_schema`.`TABLES`"+
 			"where`table_schema`=database()"+
