@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/Ompluscator/dynamic-struct v1.3.0
 	github.com/StirlingMarketingGroup/cool-mysql v0.0.19
-	github.com/fatih/color v1.18.0
+	github.com/fatih/color v1.19.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/pkg/errors v0.9.1
 	github.com/posener/cmd v1.3.4
@@ -29,7 +29,7 @@ require (
 	github.com/go-redsync/redsync/v4 v4.11.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
-	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.20 // indirect
 	github.com/posener/complete/v2 v2.0.1-alpha.13 // indirect
@@ -46,5 +46,5 @@ require (
 	golang.org/x/image v0.28.0 // indirect
 	golang.org/x/mobile v0.0.0-20250606033058-a2a15c67f36f // indirect
 	golang.org/x/sync v0.15.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/sys v0.42.0 // indirect
 )
