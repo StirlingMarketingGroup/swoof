@@ -77,7 +77,9 @@ var (
 		"swoof [flags] 'user:pass@(host)/dbname' 'user:pass@(host)/dbname' table1 table2 table3\n\n"+
 		"see: https://github.com/go-sql-driver/mysql#dsn-data-source-name\n\n"+
 		"Or, optionally, you can use your connections in your connections file like so:\n\n"+
-		"swoof [flags] production localhost table1 table2 table3")
+		"swoof [flags] production localhost table1 table2 table3\n\n"+
+		"Multiple destinations can be comma-separated:\n\n"+
+		"swoof [flags] production localhost,staging table1 table2 table3")
 )
 
 var definerRegexp = regexp.MustCompile(`\sDEFINER\s*=\s*[^ ]+`)
@@ -207,14 +209,17 @@ func main() {
 	var guard = make(chan struct{}, *threads)
 
 	sourceDSN := (*args)[0]
-	destDSN := (*args)[1]
+	destDSNs := strings.Split((*args)[1], ",")
 
-	destIsPath := strings.HasPrefix(destDSN, "file:")
-	destIsClipboard := strings.EqualFold(destDSN, "clipboard")
+	blue := color.New(color.FgBlue).SprintFunc()
+	red := color.New(color.FgRed).SprintFunc()
 
 	// lookup connection information in the users config file
 	// for much easier and shorter (and probably safer) command usage
-	if connections, err := getConnections(*connectionsFile); err == nil {
+	connections, _ := getConnections(*connectionsFile)
+
+	// resolve source connection name
+	if connections != nil {
 		if c, ok := connections[sourceDSN]; ok {
 			if c.DestOnly {
 				slog.Error("source use is not allowed by config", "source", sourceDSN)
@@ -223,32 +228,7 @@ func main() {
 
 			sourceDSN = connectionToDSN(c)
 		}
-
-		if !destIsPath && !destIsClipboard {
-			if c, ok := connections[destDSN]; ok {
-				if c.SourceOnly {
-					slog.Error("destination use is not allowed by config", "destination", destDSN)
-					os.Exit(1)
-				}
-
-				if c.Params == nil {
-					c.Params = make(map[string]string)
-				}
-
-				// we will disable foreign key checks on the destination
-				// since we are importing more than one table at a time,
-				// otherwise we *will* get errors about foreign key constraints
-				if _, ok := c.Params["foreign_key_checks"]; !ok {
-					c.Params["foreign_key_checks"] = "0"
-				}
-
-				destDSN = connectionToDSN(c)
-			}
-		}
 	}
-
-	blue := color.New(color.FgBlue).SprintFunc()
-	red := color.New(color.FgRed).SprintFunc()
 
 	// source connection is the first argument
 	// this is where our rows are coming from
@@ -273,87 +253,134 @@ func main() {
 		}
 	}
 
-	var dst *mysql.Database
-	var clipboardBuf *bytes.Buffer
-	if destIsPath {
-		name := strings.TrimPrefix(destDSN, "file:")
+	// resolve and create all destination connections upfront so that
+	// each table's data is read from the source only once and fanned
+	// out to every destination in parallel
+	type destInfo struct {
+		db          *mysql.Database
+		isPath      bool
+		isClipboard bool
+		clipboard   *bytes.Buffer
+	}
 
-		if _, err := os.Stat(name); err == nil {
-			incompleteName := name + ".incomplete"
-			oldName := name + ".old"
-			finalName := name
-			name = incompleteName
-			defer func() {
-				// if the "old" directory exists, we can remove it
-				if _, err := os.Stat(oldName); err == nil {
+	var dsts []destInfo
+	for _, rawDSN := range destDSNs {
+		destDSN := strings.TrimSpace(rawDSN)
+
+		destIsPath := strings.HasPrefix(destDSN, "file:")
+		destIsClipboard := strings.EqualFold(destDSN, "clipboard")
+
+		// resolve destination connection name
+		if connections != nil && !destIsPath && !destIsClipboard {
+			if c, ok := connections[destDSN]; ok {
+				if c.SourceOnly {
+					slog.Error("destination use is not allowed by config", "destination", destDSN)
+					os.Exit(1)
+				}
+
+				if c.Params == nil {
+					c.Params = make(map[string]string)
+				}
+
+				// we will disable foreign key checks on the destination
+				// since we are importing more than one table at a time,
+				// otherwise we *will* get errors about foreign key constraints
+				if _, ok := c.Params["foreign_key_checks"]; !ok {
+					c.Params["foreign_key_checks"] = "0"
+				}
+
+				destDSN = connectionToDSN(c)
+			}
+		}
+
+		var db *mysql.Database
+		var clipboardBuf *bytes.Buffer
+		if destIsPath {
+			name := strings.TrimPrefix(destDSN, "file:")
+
+			if _, err := os.Stat(name); err == nil {
+				incompleteName := name + ".incomplete"
+				oldName := name + ".old"
+				finalName := name
+				name = incompleteName
+				defer func() {
+					// if the "old" directory exists, we can remove it
+					if _, err := os.Stat(oldName); err == nil {
+						slog.Info("removing old directory", "directory", oldName)
+						if err := os.RemoveAll(oldName); err != nil {
+							slog.Error("failed to remove old directory", "error", err, "directory", oldName)
+							os.Exit(1)
+						}
+					}
+
+					// once we're done, we can rename the already existing directory to something else,
+					// so that we can rename our new directory to the correct name
+					slog.Info("moving directory", "from", finalName, "to", oldName)
+					if err := os.Rename(finalName, oldName); err != nil {
+						slog.Error("failed to rename directory", "error", err, "from", finalName, "to", oldName)
+						os.Exit(1)
+					}
+
+					// and then we can rename our new directory to the correct name
+					slog.Info("moving directory", "from", name, "to", finalName)
+					if err := os.Rename(name, finalName); err != nil {
+						slog.Error("failed to rename directory", "error", err, "from", name, "to", finalName)
+						os.Exit(1)
+					}
+
+					// and then we can remove the old directory
 					slog.Info("removing old directory", "directory", oldName)
 					if err := os.RemoveAll(oldName); err != nil {
 						slog.Error("failed to remove old directory", "error", err, "directory", oldName)
 						os.Exit(1)
 					}
-				}
+				}()
+			}
 
-				// once we're done, we can rename the already existing directory to something else,
-				// so that we can rename our new directory to the correct name
-				slog.Info("moving directory", "from", finalName, "to", oldName)
-				if err := os.Rename(finalName, oldName); err != nil {
-					slog.Error("failed to rename directory", "error", err, "from", finalName, "to", oldName)
-					os.Exit(1)
-				}
+			slog.Info("writing to file", "name", name)
 
-				// and then we can rename our new directory to the correct name
-				slog.Info("moving directory", "from", name, "to", finalName)
-				if err := os.Rename(name, finalName); err != nil {
-					slog.Error("failed to rename directory", "error", err, "from", name, "to", finalName)
-					os.Exit(1)
-				}
+			db, err = mysql.NewLocalWriter(name)
+			if err != nil {
+				slog.Error("failed to create local writer", "error", err, "name", name)
+				os.Exit(1)
+			}
+		} else if destIsClipboard {
+			clipboardBuf = new(bytes.Buffer)
+			clipboardBuf.WriteString("set foreign_key_checks=0;\n\n")
 
-				// and then we can remove the old directory
-				slog.Info("removing old directory", "directory", oldName)
-				if err := os.RemoveAll(oldName); err != nil {
-					slog.Error("failed to remove old directory", "error", err, "directory", oldName)
-					os.Exit(1)
-				}
-			}()
+			db, err = mysql.NewWriter(clipboardBuf)
+			if err != nil {
+				slog.Error("failed to create writer", "error", err)
+				os.Exit(1)
+			}
+		} else {
+			db, err = mysql.NewFromDSN(destDSN, destDSN)
+			if err != nil {
+				slog.Error("failed to create destination connection", "error", err, "destinationDSN", destDSN)
+				os.Exit(1)
+			}
 		}
 
-		slog.Info("writing to file", "name", name)
+		db.DisableUnusedColumnWarnings = true
 
-		dst, err = mysql.NewLocalWriter(name)
-		if err != nil {
-			slog.Error("failed to create local writer", "error", err, "name", name)
-			os.Exit(1)
+		if *verbose {
+			db.Log = func(detail mysql.LogDetail) {
+				slog.Info(fmt.Sprintf("%s %s", red("dst:"), detail.Query))
+			}
 		}
-	} else if destIsClipboard {
-		clipboardBuf = new(bytes.Buffer)
-		clipboardBuf.WriteString("set foreign_key_checks=0;\n\n")
 
-		dst, err = mysql.NewWriter(clipboardBuf)
-		if err != nil {
-			slog.Error("failed to create writer", "error", err)
-			os.Exit(1)
+		logFnDst := db.Log
+		db.Log = func(detail mysql.LogDetail) {
+			if logFnDst != nil {
+				logFnDst(detail)
+			}
 		}
-	} else {
-		dst, err = mysql.NewFromDSN(destDSN, destDSN)
-		if err != nil {
-			slog.Error("failed to create destination connection", "error", err, "destinationDSN", destDSN)
-			os.Exit(1)
-		}
+
+		dsts = append(dsts, destInfo{db, destIsPath, destIsClipboard, clipboardBuf})
 	}
 
-	dst.DisableUnusedColumnWarnings = true
-
-	if *verbose {
-		dst.Log = func(detail mysql.LogDetail) {
-			slog.Info(fmt.Sprintf("%s %s", red("dst:"), detail.Query))
-		}
-	}
-
-	logFnDst := dst.Log
-	dst.Log = func(detail mysql.LogDetail) {
-		if logFnDst != nil {
-			logFnDst(detail)
-		}
+	if len(dsts) > 1 {
+		slog.Info("importing to multiple destinations", "count", len(dsts))
 	}
 
 	tableNames, err := getTables(*aliasesFiles, *all, args, src)
@@ -362,29 +389,33 @@ func main() {
 		os.Exit(1)
 	}
 
-	// and now we can get our tables ordered by the largest physical tables first
+	// get our tables ordered by the largest physical tables first
 	// this *should* help performance, so that the longest table doesn't start last
 	// and draw out the total process time
 	// this also has the nice side effect of de-duplicating our tables list
-	tables := make(chan string, len(*tableNames))
-	go func() {
-		defer close(tables)
-		if len(*tableNames) == 0 {
-			return
+	// we collect into a slice so it can be reused across multiple destinations
+	var orderedTables []string
+	if len(*tableNames) > 0 {
+		tablesCh := make(chan string, len(*tableNames))
+		go func() {
+			defer close(tablesCh)
+			err := src.Select(tablesCh, "select`table_name`"+
+				"from`information_schema`.`TABLES`"+
+				"where`table_schema`=database()"+
+				"and`table_name`in({{ range $i, $table := .Tables }}{{ if $i }},{{ end }}{{ $table | printf `'%s'` }}{{ end }})"+
+				"and`table_type`='BASE TABLE'"+
+				"order by`data_length`+`index_length`desc", 0, mysql.Params{
+				"Tables": *tableNames,
+			})
+			if err != nil {
+				slog.Error("failed to select tables", "error", err)
+				os.Exit(1)
+			}
+		}()
+		for t := range tablesCh {
+			orderedTables = append(orderedTables, t)
 		}
-		err := src.Select(tables, "select`table_name`"+
-			"from`information_schema`.`TABLES`"+
-			"where`table_schema`=database()"+
-			"and`table_name`in({{ range $i, $table := .Tables }}{{ if $i }},{{ end }}{{ $table | printf `'%s'` }}{{ end }})"+
-			"and`table_type`='BASE TABLE'"+
-			"order by`data_length`+`index_length`desc", 0, mysql.Params{
-			"Tables": *tableNames,
-		})
-		if err != nil {
-			slog.Error("failed to select tables", "error", err)
-			os.Exit(1)
-		}
-	}()
+	}
 
 	// our multi-progress bar ties right into our wait group
 	var wg sync.WaitGroup
@@ -397,10 +428,10 @@ func main() {
 	// problem comes from us importing two tables that depend on each other; when
 	// one finishes before the other, if we create the constraints as well, then it will fail
 	// because the other table doesn't exist yet.
-	delayedFuncs := make(chan func(), len(*tableNames))
+	delayedFuncs := make(chan func(), len(orderedTables))
 
 	tableCount := 0
-	for table := range tables {
+	for _, table := range orderedTables {
 		tableCount++
 
 		// this makes sure we capture tableName in a way that it doesn't
@@ -434,9 +465,13 @@ func main() {
 		go func() {
 			defer wg.Done()
 
-			dst := dst
-			if destIsPath {
-				dst = dst.WriterWithSubdir(filepath.Join("tables", tableName))
+			// compute the per-table destination, applying WriterWithSubdir for file dests
+			tableDsts := make([]*mysql.Database, len(dsts))
+			for i, d := range dsts {
+				tableDsts[i] = d.db
+				if d.isPath {
+					tableDsts[i] = d.db.WriterWithSubdir(filepath.Join("tables", tableName))
+				}
 			}
 
 			// once this function is done, let another task take a place
@@ -577,11 +612,10 @@ func main() {
 
 			// this gets the "type" of our struct from our dynamic struct
 			structType := reflect.Indirect(reflect.ValueOf(rowStruct.Build().New())).Type()
-			// and then we make a channel with reflection for our new type of struct
-			chRef := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize)
-			ch := chRef.Interface()
-
 			columnsQuoted := columnsQuotedBld.String()
+
+			// source channel — data is read once and fanned out to all dests
+			srcChRef := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize)
 
 			if !*skipData {
 				// oh yeah, that's just one query. We don't actually have to chunk this selection
@@ -589,13 +623,13 @@ func main() {
 				// all into memory or something first, which makes this code dramatically simpler
 				// and should work with tables of all sizes
 				go func() {
-					defer chRef.Close()
+					defer srcChRef.Close()
 
 					q := "select /*+ MAX_EXECUTION_TIME(2147483647) */ " + columnsQuoted + "from`" + tableName + "`"
 					if *whereClause != "" {
 						q += " where " + *whereClause + " "
 					}
-					err := src.Select(ch, q, 0)
+					err := src.Select(srcChRef.Interface(), q, 0)
 					if err != nil {
 						slog.Error("failed to select rows", "error", err, "tableName", tableName, "columnsQuoted", columnsQuoted)
 						os.Exit(1)
@@ -634,15 +668,6 @@ func main() {
 
 				tempTableName = *tempTablePrefix + tableName
 
-				if !*dryRyn {
-					// delete the table from our destination
-					err = dst.Exec("drop table if exists`" + tempTableName + "`")
-					if err != nil {
-						slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
-						os.Exit(1)
-					}
-				}
-
 				// since foreign key constraints have globally unique names (for some reason)
 				// we can't just create our temp table with constraints because
 				// the names will likely conflict with the table that already exists
@@ -671,60 +696,67 @@ func main() {
 					table.CreateMySQL = table.CreateMySQL[:constraintsStart] + table.CreateMySQL[constraintsEnd:]
 				}
 
-				if !*dryRyn {
-					// now we can make the table on our destination
-					err := dst.Exec("CREATE TABLE `" + tempTableName + "`" + strings.TrimPrefix(table.CreateMySQL, "CREATE TABLE `"+tableName+"`"))
-					if err != nil {
-						slog.Error("failed to create table on destination", "error", err, "tableName", tempTableName)
-						os.Exit(1)
-					}
-				}
+				createSuffix := strings.TrimPrefix(table.CreateMySQL, "CREATE TABLE `"+tableName+"`")
 
-				delayedFuncs <- func() {
-					// drop the old table now that our temp table is done
+				// create the temp table on every destination
+				for _, dst := range tableDsts {
 					if !*dryRyn {
-						err := dst.Exec("drop table if exists`" + tableName + "`")
-						if err != nil {
+						// delete the table from our destination
+						if err := dst.Exec("drop table if exists`" + tempTableName + "`"); err != nil {
 							slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
 							os.Exit(1)
 						}
-					}
 
-					// rename our temp table to the real table name
-					// we could do an atomic rename here, but the problem is that atomic renames
-					// also rename all the constraints of other tables pointing to our original table, and
-					// we want those constraints to point to our new table instead
-
-					// if you're doing this live, there *is* some down time, but other tools handle this the same
-					// way, so I don't think it's unreasonable if we do the same
-					if !*dryRyn {
-						err := dst.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`")
-						if err != nil {
-							slog.Error("failed to rename table", "error", err, "from", tempTableName, "to", tableName)
+						// now we can make the table on our destination
+						if err := dst.Exec("CREATE TABLE `" + tempTableName + "`" + createSuffix); err != nil {
+							slog.Error("failed to create table on destination", "error", err, "tableName", tempTableName)
 							os.Exit(1)
 						}
 					}
+				}
 
-					// no we can add back our constraints if we have them
-					// converting our constraints to alter table syntax by removing our leading
-					// comma and adding the word "add" at the beginning of each line
-					if len(constraints) != 0 && !*dryRyn {
-						err := dst.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd"))
-						if err != nil {
-							slog.Warn("failed to add constraints to table", "error", err, "tableName", tableName)
+				// one delayed func per table that finalizes all dests
+				delayedFuncs <- func() {
+					for _, dst := range tableDsts {
+						// drop the old table now that our temp table is done
+						if !*dryRyn {
+							if err := dst.Exec("drop table if exists`" + tableName + "`"); err != nil {
+								slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
+								os.Exit(1)
+							}
+						}
+
+						// rename our temp table to the real table name
+						// we could do an atomic rename here, but the problem is that atomic renames
+						// also rename all the constraints of other tables pointing to our original table, and
+						// we want those constraints to point to our new table instead
+
+						// if you're doing this live, there *is* some down time, but other tools handle this the same
+						// way, so I don't think it's unreasonable if we do the same
+						if !*dryRyn {
+							if err := dst.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`"); err != nil {
+								slog.Error("failed to rename table", "error", err, "from", tempTableName, "to", tableName)
+								os.Exit(1)
+							}
+						}
+
+						// no we can add back our constraints if we have them
+						// converting our constraints to alter table syntax by removing our leading
+						// comma and adding the word "add" at the beginning of each line
+						if len(constraints) != 0 && !*dryRyn {
+							if err := dst.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd")); err != nil {
+								slog.Warn("failed to add constraints to table", "error", err, "tableName", tableName)
+							}
 						}
 					}
 
-					// but we can't forget our triggers!
-					// lets grab the triggers from the source table and make sure
-					// we re-create them all on our destination
+					// triggers are read from source once and applied to all dests
 					triggers := make(chan struct {
 						Trigger string
 					})
 					go func() {
 						defer close(triggers)
-						err := src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0)
-						if err != nil {
+						if err := src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0); err != nil {
 							slog.Error("failed to select triggers", "error", err, "tableName", tableName)
 							os.Exit(1)
 						}
@@ -733,8 +765,7 @@ func main() {
 						var trigger struct {
 							CreateMySQL string `mysql:"SQL Original Statement"`
 						}
-						err := src.Select(&trigger, "show create trigger`"+r.Trigger+"`", 0)
-						if err != nil {
+						if err := src.Select(&trigger, "show create trigger`"+r.Trigger+"`", 0); err != nil {
 							slog.Error("failed to select trigger creation syntax", "error", err, "trigger", r.Trigger, "tableName", tableName)
 							os.Exit(1)
 						}
@@ -745,10 +776,11 @@ func main() {
 						trigger.CreateMySQL = definerRegexp.ReplaceAllString(trigger.CreateMySQL, "")
 
 						if !*dryRyn {
-							err := dst.Exec(trigger.CreateMySQL)
-							if err != nil {
-								slog.Error("failed to execute trigger creation SQL", "error", err, "trigger", r.Trigger, "tableName", tableName)
-								os.Exit(1)
+							for _, dst := range tableDsts {
+								if err := dst.Exec(trigger.CreateMySQL); err != nil {
+									slog.Error("failed to execute trigger creation SQL", "error", err, "trigger", r.Trigger, "tableName", tableName)
+									os.Exit(1)
+								}
 							}
 						}
 					}
@@ -760,30 +792,72 @@ func main() {
 			}
 
 			if !*skipData && !*dryRyn {
-				// and if we aren't skipping the data, start the import!
-				// Now this *does* have to be chunked because there's no way to stream
-				// rows to mysql, but cool mysql handles this for us, all it needs is the same
-				// channel we got from the select
-				inserter := dst.I()
-
-				if !*noProgressBars {
-					inserter = inserter.SetAfterRowExec(func(start time.Time) {
-						bar.EwmaIncrement(time.Since(start))
-					})
+				insertPrefix := "insert into`" + tempTableName + "`"
+				if *insertIgnoreInto {
+					insertPrefix = "insert ignore into`" + tableName + "`"
 				}
 
-				if !*insertIgnoreInto {
-					err = inserter.Insert("insert into`"+tempTableName+"`", ch)
-					if err != nil {
+				if len(dsts) == 1 {
+					// single destination: use the source channel directly — zero overhead
+					inserter := tableDsts[0].I()
+
+					if !*noProgressBars {
+						inserter = inserter.SetAfterRowExec(func(start time.Time) {
+							bar.EwmaIncrement(time.Since(start))
+						})
+					}
+
+					if err := inserter.Insert(insertPrefix, srcChRef.Interface()); err != nil {
 						slog.Error("failed to insert rows into destination", "error", err, "tableName", tableName)
 						os.Exit(1)
 					}
 				} else {
-					err = inserter.Insert("insert ignore into`"+tableName+"`", ch)
-					if err != nil {
-						slog.Error("failed to insert rows into destination", "error", err, "tableName", tableName)
-						os.Exit(1)
+					// multiple destinations: fan out each row from the single source
+					// channel to per-destination channels so the source is read only once
+					dstChRefs := make([]reflect.Value, len(dsts))
+					for i := range dsts {
+						dstChRefs[i] = reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize)
 					}
+
+					go func() {
+						defer func() {
+							for _, ref := range dstChRefs {
+								ref.Close()
+							}
+						}()
+						for {
+							val, ok := srcChRef.Recv()
+							if !ok {
+								return
+							}
+							for _, ref := range dstChRefs {
+								ref.Send(val)
+							}
+						}
+					}()
+
+					var insertWg sync.WaitGroup
+					for i := range dsts {
+						insertWg.Add(1)
+						go func(i int) {
+							defer insertWg.Done()
+
+							inserter := tableDsts[i].I()
+
+							// track progress from the first destination only
+							if i == 0 && !*noProgressBars {
+								inserter = inserter.SetAfterRowExec(func(start time.Time) {
+									bar.EwmaIncrement(time.Since(start))
+								})
+							}
+
+							if err := inserter.Insert(insertPrefix, dstChRefs[i].Interface()); err != nil {
+								slog.Error("failed to insert rows into destination", "error", err, "tableName", tableName)
+								os.Exit(1)
+							}
+						}(i)
+					}
+					insertWg.Wait()
 				}
 			}
 
@@ -811,12 +885,16 @@ func main() {
 		}
 	}
 
+	// funcs, views, and procs are read from source once and applied to all dests
 	if *funcs {
 		slog.Info("importing functions...")
 
-		dst := dst
-		if destIsPath {
-			dst = dst.WriterWithSubdir("funcs")
+		funcDsts := make([]*mysql.Database, len(dsts))
+		for i, d := range dsts {
+			funcDsts[i] = d.db
+			if d.isPath {
+				funcDsts[i] = d.db.WriterWithSubdir("funcs")
+			}
 		}
 
 		var funcs []struct {
@@ -841,19 +919,21 @@ func main() {
 				os.Exit(1)
 			}
 
+			funcInfo.CreateMySQL = definerRegexp.ReplaceAllString(funcInfo.CreateMySQL, "")
+
 			if !*dryRyn {
-				err = dst.Exec("drop function if exists`" + f.FuncName + "`")
-				if err != nil {
-					slog.Error("failed to drop function", "error", err, "functionName", f.FuncName)
-					os.Exit(1)
-				}
+				for _, dst := range funcDsts {
+					err = dst.Exec("drop function if exists`" + f.FuncName + "`")
+					if err != nil {
+						slog.Error("failed to drop function", "error", err, "functionName", f.FuncName)
+						os.Exit(1)
+					}
 
-				funcInfo.CreateMySQL = definerRegexp.ReplaceAllString(funcInfo.CreateMySQL, "")
-
-				err = dst.Exec(funcInfo.CreateMySQL)
-				if err != nil {
-					slog.Error("failed to execute function creation SQL", "error", err, "functionName", f.FuncName)
-					os.Exit(1)
+					err = dst.Exec(funcInfo.CreateMySQL)
+					if err != nil {
+						slog.Error("failed to execute function creation SQL", "error", err, "functionName", f.FuncName)
+						os.Exit(1)
+					}
 				}
 			}
 		}
@@ -862,9 +942,12 @@ func main() {
 	if *views {
 		slog.Info("importing views...")
 
-		dst := dst
-		if destIsPath {
-			dst = dst.WriterWithSubdir("views")
+		viewDsts := make([]*mysql.Database, len(dsts))
+		for i, d := range dsts {
+			viewDsts[i] = d.db
+			if d.isPath {
+				viewDsts[i] = d.db.WriterWithSubdir("views")
+			}
 		}
 
 		var views []struct {
@@ -889,19 +972,21 @@ func main() {
 				os.Exit(1)
 			}
 
+			view.CreateMySQL = definerRegexp.ReplaceAllString(view.CreateMySQL, "")
+
 			if !*dryRyn {
-				err = dst.Exec("drop view if exists`" + v.ViewName + "`")
-				if err != nil {
-					slog.Error("failed to drop view", "error", err, "viewName", v.ViewName)
-					os.Exit(1)
-				}
+				for _, dst := range viewDsts {
+					err = dst.Exec("drop view if exists`" + v.ViewName + "`")
+					if err != nil {
+						slog.Error("failed to drop view", "error", err, "viewName", v.ViewName)
+						os.Exit(1)
+					}
 
-				view.CreateMySQL = definerRegexp.ReplaceAllString(view.CreateMySQL, "")
-
-				err = dst.Exec(view.CreateMySQL)
-				if err != nil {
-					slog.Error("failed to execute view creation SQL", "error", err, "viewName", v.ViewName)
-					os.Exit(1)
+					err = dst.Exec(view.CreateMySQL)
+					if err != nil {
+						slog.Error("failed to execute view creation SQL", "error", err, "viewName", v.ViewName)
+						os.Exit(1)
+					}
 				}
 			}
 		}
@@ -910,9 +995,12 @@ func main() {
 	if *procs {
 		slog.Info("importing stored procedures...")
 
-		dst := dst
-		if destIsPath {
-			dst = dst.WriterWithSubdir("procs")
+		procDsts := make([]*mysql.Database, len(dsts))
+		for i, d := range dsts {
+			procDsts[i] = d.db
+			if d.isPath {
+				procDsts[i] = d.db.WriterWithSubdir("procs")
+			}
 		}
 
 		var procs []struct {
@@ -937,37 +1025,40 @@ func main() {
 				os.Exit(1)
 			}
 
+			procInfo.CreateMySQL = definerRegexp.ReplaceAllString(procInfo.CreateMySQL, "")
+
 			if !*dryRyn {
-				err = dst.Exec("drop procedure if exists`" + p.ProcName + "`")
-				if err != nil {
-					slog.Error("failed to drop procedure", "error", err, "procedureName", p.ProcName)
-					os.Exit(1)
-				}
+				for _, dst := range procDsts {
+					err = dst.Exec("drop procedure if exists`" + p.ProcName + "`")
+					if err != nil {
+						slog.Error("failed to drop procedure", "error", err, "procedureName", p.ProcName)
+						os.Exit(1)
+					}
 
-				procInfo.CreateMySQL = definerRegexp.ReplaceAllString(procInfo.CreateMySQL, "")
-
-				err = dst.Exec(procInfo.CreateMySQL)
-				if err != nil {
-					slog.Error("failed to execute stored procedure creation SQL", "error", err, "procedureName", p.ProcName)
-					os.Exit(1)
+					err = dst.Exec(procInfo.CreateMySQL)
+					if err != nil {
+						slog.Error("failed to execute stored procedure creation SQL", "error", err, "procedureName", p.ProcName)
+						os.Exit(1)
+					}
 				}
 			}
 		}
 	}
 
-	if destIsClipboard {
-		clipboardBuf.WriteString("set foreign_key_checks=1;\n")
+	for _, d := range dsts {
+		if d.isClipboard {
+			d.clipboard.WriteString("set foreign_key_checks=1;\n")
 
-		err := clipboard.Init()
-		if err != nil {
-			slog.Error("failed to initialize clipboard", "error", err)
-			os.Exit(1)
+			if err := clipboard.Init(); err != nil {
+				slog.Error("failed to initialize clipboard", "error", err)
+				os.Exit(1)
+			}
+
+			clipboard.Write(clipboard.FmtText, d.clipboard.Bytes())
+
+			slog.Info("copied to clipboard", "size", len(d.clipboard.Bytes()))
 		}
-
-		clipboard.Write(clipboard.FmtText, clipboardBuf.Bytes())
-
-		slog.Info("copied to clipboard", "size", len(clipboardBuf.Bytes()))
 	}
 
-	slog.Info("finished importing tables", "count", tableCount, "duration", time.Since(start))
+	slog.Info("finished importing tables", "count", tableCount, "destinations", len(dsts), "duration", time.Since(start))
 }

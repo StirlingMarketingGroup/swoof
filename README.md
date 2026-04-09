@@ -53,6 +53,20 @@ swoof [flags] 'user:pass@(host)/dbname' 'user:pass@(host)/dbname' table1 table2 
 swoof [flags] production localhost table1 table2 table3
 ```
 
+### Multiple Destinations
+
+You can import to multiple destinations at once by comma-separating them:
+
+```shell
+swoof production localhost,staging table1 table2 table3
+# or with DSNs
+swoof 'user:pass@(host)/dbname' 'user:pass@(host1)/db,user:pass@(host2)/db' table1 table2
+```
+
+Source data is read only once and fanned out to all destinations in parallel, so this is significantly faster than running swoof multiple times. DDL operations (table creation, constraints, triggers) and functions/views/procedures are also queried from the source once and applied to all destinations.
+
+You can mix destination types freely — database connections, named connections, `file:` paths, and `clipboard` can all appear in the same comma-separated list.
+
 ### Wildcard tables
 
 Table arguments accept glob patterns, so you can target batches without typing each name. Wrap the pattern in quotes so your shell does not expand it locally. `*` matches any number of characters, `?` matches a single character, and patterns are resolved against base tables on the source connection.
