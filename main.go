@@ -21,6 +21,7 @@ import (
 	dynamicstruct "github.com/Ompluscator/dynamic-struct"
 	mysql "github.com/StirlingMarketingGroup/cool-mysql"
 	"github.com/fatih/color"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/posener/cmd"
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
@@ -264,8 +265,10 @@ func main() {
 	}
 
 	var dsts []destInfo
+	seenDestKeys := make(map[string]string)
 	for _, rawDSN := range destDSNs {
 		destDSN := strings.TrimSpace(rawDSN)
+		friendlyName := destDSN
 
 		destIsPath := strings.HasPrefix(destDSN, "file:")
 		destIsClipboard := strings.EqualFold(destDSN, "clipboard")
@@ -291,6 +294,28 @@ func main() {
 
 				destDSN = connectionToDSN(c)
 			}
+		}
+
+		// warn when two destinations resolve to the same physical target, since
+		// concurrent writes would collide on the shared temp table
+		var dedupeKey string
+		switch {
+		case destIsPath:
+			dedupeKey = "file:" + strings.TrimPrefix(destDSN, "file:")
+		case destIsClipboard:
+			dedupeKey = "clipboard"
+		default:
+			if cfg, parseErr := mysqldriver.ParseDSN(destDSN); parseErr == nil {
+				dedupeKey = cfg.User + "@" + cfg.Addr + "/" + cfg.DBName
+			} else {
+				dedupeKey = destDSN
+			}
+		}
+		if prev, ok := seenDestKeys[dedupeKey]; ok {
+			label := color.New(color.FgHiYellow).Sprint("⚠ duplicate destination")
+			fmt.Fprintf(os.Stderr, "%s: %q resolves to the same target as %q; concurrent writes will collide on the temp table\n", label, friendlyName, prev)
+		} else {
+			seenDestKeys[dedupeKey] = friendlyName
 		}
 
 		var db *mysql.Database
