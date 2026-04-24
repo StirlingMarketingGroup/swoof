@@ -4,7 +4,8 @@ go 1.25.0
 
 require (
 	github.com/Ompluscator/dynamic-struct v1.3.0
-	github.com/StirlingMarketingGroup/cool-mysql v0.0.21
+	github.com/StirlingMarketingGroup/cool-mysql v0.0.23
+	github.com/cenkalti/backoff/v5 v5.0.1
 	github.com/fatih/color v1.19.0
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/pkg/errors v0.9.1
@@ -12,6 +13,7 @@ require (
 	github.com/vbauerster/mpb/v8 v8.12.0
 	golang.design/x/clipboard v0.7.1
 	golang.org/x/mod v0.35.0
+	golang.org/x/sync v0.15.0
 	gopkg.in/yaml.v2 v2.4.0
 )
 
@@ -21,7 +23,6 @@ require (
 	github.com/VividCortex/ewma v1.2.0 // indirect
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
 	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf // indirect
-	github.com/cenkalti/backoff/v5 v5.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
@@ -45,6 +46,5 @@ require (
 	golang.org/x/exp v0.0.0-20190731235908-ec7cb31e5a56 // indirect
 	golang.org/x/image v0.38.0 // indirect
 	golang.org/x/mobile v0.0.0-20250606033058-a2a15c67f36f // indirect
-	golang.org/x/sync v0.15.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 )
