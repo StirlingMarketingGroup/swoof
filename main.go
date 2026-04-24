@@ -533,15 +533,10 @@ func main() {
 					slog.Warn("retrying table import",
 						"tableName", tableName,
 						"attempt", attempt)
-					// Roll back any partial temp table before retrying — a previous
-					// attempt may have created it but died mid-insert.
-					for _, dst := range tableDsts {
-						if !*dryRyn {
-							if err := dst.Exec("drop table if exists`" + tempTableName + "`"); err != nil {
-								return struct{}{}, backoff.Permanent(fmt.Errorf("retry cleanup drop %q: %w", tempTableName, err))
-							}
-						}
-					}
+					// No explicit temp-table cleanup here: the DDL phase below
+					// runs `drop table if exists` before `CREATE TABLE` on every
+					// attempt, so any orphaned temp table from the previous run
+					// gets replaced naturally.
 					if bar != nil {
 						bar.SetCurrent(0)
 					}
@@ -880,12 +875,21 @@ func main() {
 								}
 							}()
 							doneRef := reflect.ValueOf(ctx.Done())
-							for {
-								// Recv with ctx cancellation awareness.
-								recvCases := []reflect.SelectCase{
-									{Dir: reflect.SelectRecv, Chan: srcChRef},
+							// Pre-allocated reflect.SelectCase slices — reused every
+							// iteration. Allocating fresh per-row would burn millions
+							// of tiny allocations on a big multi-dest fan-out.
+							recvCases := []reflect.SelectCase{
+								{Dir: reflect.SelectRecv, Chan: srcChRef},
+								{Dir: reflect.SelectRecv, Chan: doneRef},
+							}
+							sendCasesByDest := make([][]reflect.SelectCase, len(dstChRefs))
+							for i, ref := range dstChRefs {
+								sendCasesByDest[i] = []reflect.SelectCase{
+									{Dir: reflect.SelectSend, Chan: ref},
 									{Dir: reflect.SelectRecv, Chan: doneRef},
 								}
+							}
+							for {
 								chosen, val, ok := reflect.Select(recvCases)
 								if chosen == 1 {
 									return ctx.Err()
@@ -896,12 +900,9 @@ func main() {
 								// Send to each dest channel with ctx cancellation awareness —
 								// otherwise a downed insert goroutine that stopped receiving
 								// would deadlock the fan-out.
-								for _, ref := range dstChRefs {
-									sendCases := []reflect.SelectCase{
-										{Dir: reflect.SelectSend, Chan: ref, Send: val},
-										{Dir: reflect.SelectRecv, Chan: doneRef},
-									}
-									if chosen, _, _ := reflect.Select(sendCases); chosen == 1 {
+								for i := range dstChRefs {
+									sendCasesByDest[i][0].Send = val
+									if chosen, _, _ := reflect.Select(sendCasesByDest[i]); chosen == 1 {
 										return ctx.Err()
 									}
 								}
