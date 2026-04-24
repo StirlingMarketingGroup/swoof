@@ -43,6 +43,35 @@ func ensureUTCSession(dsn string) (string, error) {
 	return cfg.FormatDSN(), nil
 }
 
+// ensureLongSourceStream injects net_write_timeout=86400 into the DSN's
+// params if the user hasn't set one. Multi-table runs share a single
+// destination pool, which divides write capacity across N concurrent
+// inserters so each table's inserts run at ~1/N the rate they'd reach
+// alone. The source→dest channel fills behind that bottleneck, the
+// source-stream goroutine blocks on channel Send, Go stops reading from
+// the TCP socket, the source server's TCP send buffer fills, and the
+// server's net_write_timeout (60s default) fires and closes the conn.
+// The driver surfaces this as io.ErrUnexpectedEOF, the table import
+// retries from row 0 — expensive on large tables. Single-table runs
+// never trip this: no shared dest, no backpressure.
+//
+// 86400 (24h) leaves real failures to the retry path; it just stops the
+// server from cleaning up a stream that still has work to do.
+func ensureLongSourceStream(dsn string) (string, error) {
+	cfg, err := mysqldriver.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("parse DSN: %w", err)
+	}
+	if _, ok := cfg.Params["net_write_timeout"]; ok {
+		return dsn, nil
+	}
+	if cfg.Params == nil {
+		cfg.Params = make(map[string]string)
+	}
+	cfg.Params["net_write_timeout"] = "86400"
+	return cfg.FormatDSN(), nil
+}
+
 // formatShort renders counts the way dashboards do: under 1000 unchanged,
 // otherwise one decimal plus K / M / B / T. Hand-rolled instead of fmt.Sprintf
 // because the progress-bar decorators call this on every repaint for every
@@ -119,6 +148,28 @@ func formatErrorChain(err error) string {
 		err = next
 	}
 	return b.String()
+}
+
+// extractErrorStack walks the chain for the innermost pkg/errors stack (i.e.
+// the goroutine-local wrap point nearest the raise site) and formats it one
+// frame per line. Returns "" when no layer carries a stack — nothing in the
+// chain had a pkg/errors wrap, so the logger should fall back to just the
+// chain summary.
+func extractErrorStack(err error) string {
+	type stackTracer interface {
+		StackTrace() errors.StackTrace
+	}
+	var innermost errors.StackTrace
+	for err != nil {
+		if st, ok := err.(stackTracer); ok {
+			innermost = st.StackTrace()
+		}
+		err = stderrors.Unwrap(err)
+	}
+	if innermost == nil {
+		return ""
+	}
+	return fmt.Sprintf("%+v", innermost)
 }
 
 // isTransientError reports whether err is worth retrying a whole-table import for.
