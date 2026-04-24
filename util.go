@@ -15,6 +15,34 @@ import (
 	"github.com/pkg/errors"
 )
 
+// ensureUTCSession injects time_zone='+00:00' into the DSN's params if the
+// user hasn't set one explicitly, so every conn the pool opens comes up with
+// its session tz anchored to UTC (go-sql-driver runs SET on unknown DSN
+// params as part of each new conn's init).
+//
+// Both sides of a swoof run must agree on session tz or schema replay breaks.
+// MySQL stores TIMESTAMP defaults as UTC internally, SHOW CREATE TABLE
+// renders them in the source's session tz, and the destination parses that
+// literal in its own session tz before converting back to UTC for storage.
+// When the two tzs differ, the round-trip shifts boundary values — notably
+// TIMESTAMP(6)'s 2038-01-19 03:14:07.999999 max — past the signed-32-bit
+// seconds range, and strict MySQL rejects the CREATE with ER_INVALID_DEFAULT.
+// Anchoring both sides to UTC makes the round-trip identity.
+func ensureUTCSession(dsn string) (string, error) {
+	cfg, err := mysqldriver.ParseDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("parse DSN: %w", err)
+	}
+	if _, ok := cfg.Params["time_zone"]; ok {
+		return dsn, nil
+	}
+	if cfg.Params == nil {
+		cfg.Params = make(map[string]string)
+	}
+	cfg.Params["time_zone"] = "'+00:00'"
+	return cfg.FormatDSN(), nil
+}
+
 // formatShort renders counts the way dashboards do: under 1000 unchanged,
 // otherwise one decimal plus K / M / B / T. Hand-rolled instead of fmt.Sprintf
 // because the progress-bar decorators call this on every repaint for every
