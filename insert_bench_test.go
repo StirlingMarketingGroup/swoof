@@ -34,7 +34,7 @@ func BenchmarkInsertRowBuild(b *testing.B) {
 	// allocations for the row contents.
 	sliceType := reflect.SliceOf(structType)
 	rows := reflect.MakeSlice(sliceType, rowsPerBatch, rowsPerBatch)
-	for i := 0; i < rowsPerBatch; i++ {
+	for i := range rowsPerBatch {
 		rows.Index(i).Set(makeBenchRow(structType, i))
 	}
 
@@ -64,7 +64,7 @@ func BenchmarkInsertRowBuildChan(b *testing.B) {
 
 	sliceType := reflect.SliceOf(structType)
 	rows := reflect.MakeSlice(sliceType, rowsPerBatch, rowsPerBatch)
-	for i := 0; i < rowsPerBatch; i++ {
+	for i := range rowsPerBatch {
 		rows.Index(i).Set(makeBenchRow(structType, i))
 	}
 
@@ -78,7 +78,7 @@ func BenchmarkInsertRowBuildChan(b *testing.B) {
 
 		go func() {
 			defer ch.Close()
-			for i := 0; i < rowsPerBatch; i++ {
+			for i := range rowsPerBatch {
 				ch.Send(rows.Index(i))
 			}
 		}()
