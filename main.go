@@ -24,6 +24,7 @@ import (
 	"github.com/cenkalti/backoff/v5"
 	"github.com/fatih/color"
 	mysqldriver "github.com/go-sql-driver/mysql"
+	"github.com/pkg/errors"
 	"github.com/posener/cmd"
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
@@ -240,6 +241,14 @@ func main() {
 	sourceDSN, err := ensureUTCSession(sourceDSN)
 	if err != nil {
 		slog.Error("failed to apply UTC session tz to source DSN", "error", err)
+		os.Exit(1)
+	}
+
+	// Stop the source server from killing a streaming read conn when dest
+	// backpressure stalls our TCP read side.
+	sourceDSN, err = ensureLongSourceStream(sourceDSN)
+	if err != nil {
+		slog.Error("failed to apply net_write_timeout to source DSN", "error", err)
 		os.Exit(1)
 	}
 
@@ -564,7 +573,7 @@ func main() {
 				// cursors and metadata queries don't contend on a shared pool.
 				srcTable, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
 				if err != nil {
-					return struct{}{}, fmt.Errorf("open source connection for %q: %w", tableName, err)
+					return struct{}{}, errors.Wrapf(err, "open source connection for %q", tableName)
 				}
 				defer func() {
 					if err := srcTable.Close(); err != nil {
@@ -685,7 +694,7 @@ func main() {
 						for range columns {
 						}
 						<-columnsErrCh
-						return struct{}{}, backoff.Permanent(fmt.Errorf("unknown mysql column type %q for column %q on table %q", c.ColumnType, c.ColumnName, tableName))
+						return struct{}{}, backoff.Permanent(errors.Errorf("unknown mysql column type %q for column %q on table %q", c.ColumnType, c.ColumnName, tableName))
 					}
 
 					rowStruct.AddField(f, v, tag)
@@ -695,7 +704,7 @@ func main() {
 				// Synchronously collect the columns goroutine's result before any
 				// destination DDL runs — this is the fix for the close/ctx race.
 				if err := <-columnsErrCh; err != nil {
-					return struct{}{}, fmt.Errorf("select columns for %q: %w", tableName, err)
+					return struct{}{}, errors.Wrapf(err, "select columns for %q", tableName)
 				}
 
 				structType := reflect.Indirect(reflect.ValueOf(rowStruct.Build().New())).Type()
@@ -713,7 +722,7 @@ func main() {
 						countQ += " where " + *whereClause + " "
 					}
 					if err := srcTable.SelectContext(ctx, &count, countQ, 0); err != nil {
-						return struct{}{}, fmt.Errorf("count rows for %q: %w", tableName, err)
+						return struct{}{}, errors.Wrapf(err, "count rows for %q", tableName)
 					}
 					bar.SetTotal(count, false)
 				}
@@ -728,7 +737,7 @@ func main() {
 						CreateMySQL string `mysql:"Create Table"`
 					}
 					if err := srcTable.SelectContext(ctx, &tableInfo, "show create table`"+tableName+"`", 0); err != nil {
-						return struct{}{}, fmt.Errorf("show create table %q: %w", tableName, err)
+						return struct{}{}, errors.Wrapf(err, "show create table %q", tableName)
 					}
 
 					// FK constraints have globally unique names, so creating the temp table
@@ -751,10 +760,10 @@ func main() {
 					for _, dst := range tableDsts {
 						if !*dryRyn {
 							if err := dst.Exec("drop table if exists`" + tempTableName + "`"); err != nil {
-								return struct{}{}, fmt.Errorf("drop temp table %q: %w", tempTableName, err)
+								return struct{}{}, errors.Wrapf(err, "drop temp table %q", tempTableName)
 							}
 							if err := dst.Exec("CREATE TABLE `" + tempTableName + "`" + createSuffix); err != nil {
-								return struct{}{}, fmt.Errorf("create temp table %q: %w", tempTableName, err)
+								return struct{}{}, errors.Wrapf(err, "create temp table %q", tempTableName)
 							}
 						}
 					}
@@ -847,7 +856,7 @@ func main() {
 							q += " where " + *whereClause + " "
 						}
 						if err := srcTable.SelectContext(ctx, srcChRef.Interface(), q, 0); err != nil {
-							return fmt.Errorf("select rows for %q: %w", tableName, err)
+							return errors.Wrapf(err, "select rows for %q", tableName)
 						}
 						return nil
 					})
@@ -862,7 +871,7 @@ func main() {
 								})
 							}
 							if err := inserter.InsertContext(ctx, insertPrefix, srcChRef.Interface()); err != nil {
-								return fmt.Errorf("insert into %q: %w", tableName, err)
+								return errors.Wrapf(err, "insert into %q", tableName)
 							}
 							return nil
 						})
@@ -925,7 +934,7 @@ func main() {
 									})
 								}
 								if err := inserter.InsertContext(ctx, insertPrefix, dstChRefs[j].Interface()); err != nil {
-									return fmt.Errorf("insert into %q (dest %d): %w", tableName, j, err)
+									return errors.Wrapf(err, "insert into %q (dest %d)", tableName, j)
 								}
 								return nil
 							})
@@ -973,7 +982,8 @@ func main() {
 					"tableName", tableName,
 					"attempt", attempts,
 					"error", err,
-					"chain", formatErrorChain(err))
+					"chain", formatErrorChain(err),
+					"stack", extractErrorStack(err))
 				return v, err
 			}
 
@@ -993,6 +1003,7 @@ func main() {
 				slog.Error("table import failed after retries",
 					"error", inner,
 					"chain", formatErrorChain(inner),
+					"stack", extractErrorStack(inner),
 					"tableName", tableName,
 					"attempts", attempts)
 				os.Exit(1)
