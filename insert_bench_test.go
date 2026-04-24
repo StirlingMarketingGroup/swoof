@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"reflect"
@@ -43,7 +42,7 @@ func BenchmarkInsertRowBuild(b *testing.B) {
 	b.ResetTimer()
 
 	for b.Loop() {
-		if err := db.I().InsertContext(context.Background(),
+		if err := db.I().InsertContext(b.Context(),
 			benchInsertQuery, rows.Interface()); err != nil {
 			b.Fatal(err)
 		}
@@ -52,7 +51,8 @@ func BenchmarkInsertRowBuild(b *testing.B) {
 
 // BenchmarkInsertRowBuildChan layers the reflect.Chan ping-pong back on, so we
 // can see how much of the in-production cost is scheduler / channel versus
-// the marshal path itself. Same rows, same sink.
+// the marshal path itself. Same rows, same sink — row generation is hoisted
+// out of b.Loop so we measure channel + insert, not makeBenchRow.
 func BenchmarkInsertRowBuildChan(b *testing.B) {
 	structType := buildBenchStructType()
 	rowsPerBatch := 5_000
@@ -62,20 +62,28 @@ func BenchmarkInsertRowBuildChan(b *testing.B) {
 		b.Fatal(err)
 	}
 
+	sliceType := reflect.SliceOf(structType)
+	rows := reflect.MakeSlice(sliceType, rowsPerBatch, rowsPerBatch)
+	for i := 0; i < rowsPerBatch; i++ {
+		rows.Index(i).Set(makeBenchRow(structType, i))
+	}
+
+	chanType := reflect.ChanOf(reflect.BothDir, structType)
+
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for b.Loop() {
-		ch := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), 10_000)
+		ch := reflect.MakeChan(chanType, 10_000)
 
 		go func() {
 			defer ch.Close()
 			for i := 0; i < rowsPerBatch; i++ {
-				ch.Send(makeBenchRow(structType, i))
+				ch.Send(rows.Index(i))
 			}
 		}()
 
-		if err := db.I().InsertContext(context.Background(),
+		if err := db.I().InsertContext(b.Context(),
 			benchInsertQuery, ch.Interface()); err != nil {
 			b.Fatal(err)
 		}
@@ -95,7 +103,7 @@ func buildBenchStructType() reflect.Type {
 	s.AddField("F8", new(uint32), `mysql:"qty"`)
 	s.AddField("F9", new(int8), `mysql:"flags"`)
 	s.AddField("F10", new(json.RawMessage), `mysql:"metadata"`)
-	return reflect.Indirect(reflect.ValueOf(s.Build().New())).Type()
+	return reflect.TypeOf(s.Build().New()).Elem()
 }
 
 func makeBenchRow(t reflect.Type, i int) reflect.Value {
