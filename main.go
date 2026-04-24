@@ -474,13 +474,11 @@ func main() {
 
 		var bar *mpb.Bar
 		if !*noProgressBars {
-			// Counters and rate are rendered as "1.1K / 1.6M" via formatShort —
-			// raw row counts were readable but required mental parsing.
-			// Rate = cumulative rows ÷ elapsed since the bar was created, tracked
-			// locally so we can run the value through formatShort. Using our own
-			// clock rather than decor.AverageSpeed's internal one also means retry
-			// resets (bar.SetCurrent(0)) behave consistently.
+			// Tracked locally so the rate closure can feed its value through
+			// formatShort; also means retry's bar.SetCurrent(0) keeps the
+			// displayed rate honest.
 			tableStart := time.Now()
+			var finalElapsed time.Duration
 			bar = p.New(0,
 				mpb.BarStyle(),
 				mpb.PrependDecorators(
@@ -492,10 +490,20 @@ func main() {
 						return "( " + color.HiCyanString(formatShort(s.Current)+"/"+formatShort(s.Total)) + ", "
 					}),
 					decor.Any(func(s decor.Statistics) string {
-						elapsed := time.Since(tableStart).Seconds()
+						// Freeze the elapsed value on completion so the displayed
+						// rate stops drifting downward as the decorator keeps firing.
+						var elapsed time.Duration
+						if s.Completed {
+							if finalElapsed == 0 {
+								finalElapsed = time.Since(tableStart)
+							}
+							elapsed = finalElapsed
+						} else {
+							elapsed = time.Since(tableStart)
+						}
 						var rate int64
 						if elapsed > 0 {
-							rate = int64(float64(s.Current) / elapsed)
+							rate = int64(float64(s.Current) / elapsed.Seconds())
 						}
 						return " " + color.HiGreenString(formatShort(rate)+"/s") + " ) "
 					}),
@@ -521,33 +529,21 @@ func main() {
 
 			tempTableName := *tempTablePrefix + tableName
 
-			attempt := 0
-
-			// One attempt at importing this table. On any error we let the retry wrapper
-			// above decide whether to drop the orphaned temp table and go again. Safe to
-			// retry because the real table is only swapped in by the delayed finalization
-			// pass, which only runs after the attempt completes without error.
-			runOnce := func() (struct{}, error) {
-				attempt++
+			// Safe to retry because the real table is only swapped in by the
+			// delayed finalization pass, which runs after the attempt succeeds.
+			runOnce := func(attempt int) (struct{}, error) {
 				if attempt > 1 {
 					slog.Warn("retrying table import",
 						"tableName", tableName,
 						"attempt", attempt)
-					// No explicit temp-table cleanup here: the DDL phase below
-					// runs `drop table if exists` before `CREATE TABLE` on every
-					// attempt, so any orphaned temp table from the previous run
-					// gets replaced naturally.
 					if bar != nil {
 						bar.SetCurrent(0)
 					}
 				}
 
-				// Per-attempt source connection: a fresh *sql.DB pool per try. Each
-				// table goroutine gets its own pool so concurrent streaming cursors
-				// and metadata queries don't fight each other (the "busy" bug under
-				// -t > 1). Doing the open inside runOnce — rather than once per
-				// outer goroutine — means NewFromDSN / Ping failures (transient
-				// network, max_connections bursts) also go through the retry loop.
+				// Fresh *sql.DB pool per attempt so NewFromDSN / Ping failures
+				// also go through the retry loop, and each table goroutine's
+				// cursors and metadata queries don't contend on a shared pool.
 				srcTable, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
 				if err != nil {
 					return struct{}{}, fmt.Errorf("open source connection for %q: %w", tableName, err)
@@ -557,9 +553,8 @@ func main() {
 						slog.Warn("failed to close per-attempt source pool", "error", err, "tableName", tableName)
 					}
 				}()
-				// Disable SetConnMaxLifetime on the per-table pool. cool-mysql's default
-				// (27s, Lambda-oriented) would needlessly recycle otherwise-healthy
-				// connections mid-stream on multi-hour table imports.
+				// Don't recycle connections mid-stream — cool-mysql's 27s default
+				// is Lambda-oriented and wrong for multi-hour table imports.
 				srcTable.SetMaxConnectionTime(0)
 				srcTable.DisableUnusedColumnWarnings = true
 				if src.Log != nil {
@@ -574,13 +569,11 @@ func main() {
 					GenerationExpression string `mysql:"GENERATION_EXPRESSION"`
 				})
 
-				// Stream column metadata so we can build the row struct before the
-				// full row stream starts. Deliberately NOT part of the downstream
-				// errgroup — if it were, the metadata goroutine's defer close(columns)
-				// would race the errgroup's async ctx cancellation. The drain loop
-				// could see the channel closed before ctx was cancelled, slip past
-				// any ctx.Err() check, and run destination DDL on a failed metadata
-				// fetch. Explicit error channel + synchronous wait eliminates that race.
+				// Deliberately outside the errgroup below: errgroup cancels ctx
+				// asynchronously after a goroutine returns an error, but the
+				// metadata goroutine's defer close(columns) runs first, so the
+				// drain loop could see a clean channel close and proceed into
+				// destination DDL before the error surfaced.
 				//
 				// `GENERATION_EXPRESSION` sometimes exists and sometimes doesn't, so we can't select for it.
 				// You MAY be able to check the `INFORMATION_SCHEMA` table for column info on `INFORMATION_SCHEMA` itself
@@ -752,27 +745,25 @@ func main() {
 						// Queued to run after all tables finish importing. Renames the temp
 						// table over the real one, re-adds constraints, and copies triggers.
 						delayedFuncs <- func() {
-							for _, dst := range tableDsts {
-								if !*dryRyn {
+							if !*dryRyn {
+								for _, dst := range tableDsts {
 									if err := dst.Exec("drop table if exists`" + tableName + "`"); err != nil {
 										slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
 										os.Exit(1)
 									}
-								}
 
-								// Non-atomic rename on purpose — atomic would also rename
-								// other tables' FK references to point at the old name.
-								// Small downtime on live dest is the accepted tradeoff.
-								if !*dryRyn {
+									// Non-atomic rename on purpose — atomic would also rename
+									// other tables' FK references to point at the old name.
+									// Small downtime on live dest is the accepted tradeoff.
 									if err := dst.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`"); err != nil {
 										slog.Error("failed to rename table", "error", err, "from", tempTableName, "to", tableName)
 										os.Exit(1)
 									}
-								}
 
-								if len(constraints) != 0 && !*dryRyn {
-									if err := dst.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd")); err != nil {
-										slog.Warn("failed to add constraints to table", "error", err, "tableName", tableName)
+									if len(constraints) != 0 {
+										if err := dst.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd")); err != nil {
+											slog.Warn("failed to add constraints to table", "error", err, "tableName", tableName)
+										}
 									}
 								}
 							}
@@ -824,13 +815,10 @@ func main() {
 						insertPrefix = "insert ignore into`" + tableName + "`"
 					}
 
-					// Source channel — data is read once and fanned out to all dests.
-					// Spawned here, AFTER every synchronous setup step (count, show
-					// create, temp-table DDL) has succeeded. If we started the stream
-					// any earlier, a pre-insert failure would return without calling
-					// g.Wait(), leaving the producer goroutine blocked sending into a
-					// buffer nobody drains and holding a source connection across the
-					// retry — a leak the reviewer caught.
+					// Spawned only after every synchronous setup step succeeds — a
+					// pre-insert failure would otherwise return without g.Wait(),
+					// leaking this producer blocked on a buffer with no consumer
+					// and holding a source connection across the retry.
 					srcChRef := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize)
 
 					g.Go(func() error {
@@ -851,8 +839,8 @@ func main() {
 						g.Go(func() error {
 							inserter := tableDsts[0].I()
 							if !*noProgressBars {
-								inserter = inserter.SetAfterRowExec(func(start time.Time) {
-									bar.EwmaIncrement(time.Since(start))
+								inserter = inserter.SetAfterRowExec(func(_ time.Time) {
+									bar.Increment()
 								})
 							}
 							if err := inserter.InsertContext(ctx, insertPrefix, srcChRef.Interface()); err != nil {
@@ -914,8 +902,8 @@ func main() {
 								inserter := tableDsts[j].I()
 								// Track progress from the first destination only.
 								if j == 0 && !*noProgressBars {
-									inserter = inserter.SetAfterRowExec(func(start time.Time) {
-										bar.EwmaIncrement(time.Since(start))
+									inserter = inserter.SetAfterRowExec(func(_ time.Time) {
+										bar.Increment()
 									})
 								}
 								if err := inserter.InsertContext(ctx, insertPrefix, dstChRefs[j].Interface()); err != nil {
@@ -939,29 +927,24 @@ func main() {
 				return struct{}{}, nil
 			}
 
-			// Retry wrapper. Transient errors (network blip, pool "busy" state, server
-			// hiccup) cause a full table reload from scratch. Non-transient errors
-			// (schema shape, syntax) are wrapped as backoff.Permanent inside runOnce
-			// and short-circuit the loop.
 			bop := backoff.NewExponentialBackOff()
 			bop.InitialInterval = 1 * time.Second
 			bop.MaxInterval = 30 * time.Second
 
+			attempts := 0
 			wrappedOp := func() (struct{}, error) {
-				v, err := runOnce()
+				attempts++
+				v, err := runOnce(attempts)
 				if err == nil {
 					return v, nil
 				}
-				// Already marked permanent inside runOnce — surface as-is.
 				var perm *backoff.PermanentError
 				if stderrors.As(err, &perm) {
 					return v, err
 				}
-				// -insert-ignore writes directly to the real table with no temp
-				// staging, so retrying after a partial first attempt would double-
-				// insert rows on tables without a unique key (and leave partial
-				// first-attempt rows behind even on tables with one). Retries are
-				// only safe with the temp-table swap pattern.
+				// -insert-ignore writes directly to the real table (no temp swap),
+				// so retry after a partial first attempt would double-insert rows
+				// on tables without a unique key.
 				if *insertIgnoreInto {
 					return v, backoff.Permanent(err)
 				}
@@ -970,7 +953,7 @@ func main() {
 				}
 				slog.Warn("transient table import error, will retry",
 					"tableName", tableName,
-					"attempt", attempt,
+					"attempt", attempts,
 					"error", err,
 					"chain", formatErrorChain(err))
 				return v, err
@@ -979,9 +962,11 @@ func main() {
 			if _, err := backoff.Retry(context.Background(), wrappedOp,
 				backoff.WithBackOff(bop),
 				backoff.WithMaxTries(5),
+				// Disable backoff's default 15-minute total-time budget — a
+				// multi-hour table attempt would exceed it on the first try
+				// and skip retry entirely. MaxTries above bounds attempts.
+				backoff.WithMaxElapsedTime(0),
 			); err != nil {
-				// Strip any *backoff.PermanentError wrapper so the log shows the
-				// underlying cause directly.
 				inner := err
 				var perm *backoff.PermanentError
 				if stderrors.As(err, &perm) {
@@ -991,7 +976,7 @@ func main() {
 					"error", inner,
 					"chain", formatErrorChain(inner),
 					"tableName", tableName,
-					"attempts", attempt)
+					"attempts", attempts)
 				os.Exit(1)
 			}
 

@@ -16,19 +16,58 @@ import (
 )
 
 // formatShort renders counts the way dashboards do: under 1000 unchanged,
-// otherwise one decimal plus K / M / B. Matches the "1.1K, 500, 1.6M" feel
-// requested for the progress bar counters.
+// otherwise one decimal plus K / M / B / T. Hand-rolled instead of fmt.Sprintf
+// because the progress-bar decorators call this on every repaint for every
+// concurrent table, and float boxing + Sprintf allocations add up.
 func formatShort(n int64) string {
-	switch {
-	case n < 1_000:
+	if n < 1_000 {
 		return strconv.FormatInt(n, 10)
-	case n < 1_000_000:
-		return fmt.Sprintf("%.1fK", float64(n)/1_000)
-	case n < 1_000_000_000:
-		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
-	default:
-		return fmt.Sprintf("%.1fB", float64(n)/1_000_000_000)
 	}
+
+	var divisor int64
+	var suffix byte
+	switch {
+	case n < 1_000_000:
+		divisor, suffix = 1_000, 'K'
+	case n < 1_000_000_000:
+		divisor, suffix = 1_000_000, 'M'
+	case n < 1_000_000_000_000:
+		divisor, suffix = 1_000_000_000, 'B'
+	default:
+		divisor, suffix = 1_000_000_000_000, 'T'
+	}
+
+	// Round to one decimal, carrying into the whole part when that rounding
+	// tips up a unit (e.g. 1_950_000 → 2.0M rather than 1.10M).
+	scaled := (n*10 + divisor/2) / divisor
+	whole := scaled / 10
+	tenth := scaled % 10
+
+	// If rounding pushed us to 1000.X of this suffix, promote to the next one.
+	// Without this, 999_950 → "1000.0K" instead of "1.0M".
+	if whole >= 1000 {
+		var nextDiv int64
+		switch suffix {
+		case 'K':
+			suffix, nextDiv = 'M', 1_000_000
+		case 'M':
+			suffix, nextDiv = 'B', 1_000_000_000
+		case 'B':
+			suffix, nextDiv = 'T', 1_000_000_000_000
+		}
+		if nextDiv > 0 {
+			scaled = (n*10 + nextDiv/2) / nextDiv
+			whole = scaled / 10
+			tenth = scaled % 10
+		}
+		// case 'T' with no nextDiv: saturate. "1234.5T" renders as-is
+		// with whole unchanged from the initial T-bucket math.
+	}
+
+	var buf [24]byte
+	out := strconv.AppendInt(buf[:0], whole, 10)
+	out = append(out, '.', byte('0'+tenth), suffix)
+	return string(out)
 }
 
 // formatErrorChain walks err.Unwrap() and returns a human-readable "[type] msg -> [type] msg"
@@ -55,19 +94,17 @@ func formatErrorChain(err error) string {
 }
 
 // isTransientError reports whether err is worth retrying a whole-table import for.
-// Kept deliberately permissive — a false positive costs a retry, a false negative
-// costs the whole swoof run. Schema / syntax / auth errors still fail fast.
+// Deliberately permissive — a false positive costs a retry, a false negative
+// costs the whole swoof run.
 func isTransientError(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	// Caller-initiated cancellation is not transient.
 	if stderrors.Is(err, context.Canceled) {
 		return false
 	}
 
-	// Driver-level / stdlib transient signals.
 	if stderrors.Is(err, context.DeadlineExceeded) ||
 		stderrors.Is(err, mysqldriver.ErrInvalidConn) ||
 		stderrors.Is(err, driver.ErrBadConn) ||
@@ -76,13 +113,11 @@ func isTransientError(err error) bool {
 		return true
 	}
 
-	// Any net.Error: timeouts, connection resets, broken pipes, etc.
 	var nerr net.Error
 	if stderrors.As(err, &nerr) {
 		return true
 	}
 
-	// MySQL server codes we know are safe to retry.
 	var mysqlErr *mysqldriver.MySQLError
 	if stderrors.As(err, &mysqlErr) {
 		switch mysqlErr.Number {
@@ -97,15 +132,14 @@ func isTransientError(err error) bool {
 		}
 	}
 
-	// String-matched patterns. These are the shapes of the "intermittent busy"
-	// failures we see under -t > 1 on wifi. "connection is busy" is stdlib
-	// database/sql, "busy buffer" is go-sql-driver. Both indicate a pool /
-	// concurrency state problem that a fresh attempt should clear.
+	// String-matched fallbacks for errors that don't expose a typed form.
+	// "connection is busy" is stdlib database/sql, "busy buffer" is
+	// go-sql-driver — both indicate concurrent-state corruption a fresh
+	// attempt should clear.
 	msg := err.Error()
 	for _, pat := range []string{
 		"connection is busy",
 		"busy buffer",
-		"bad connection",
 		"connection reset",
 		"broken pipe",
 	} {
