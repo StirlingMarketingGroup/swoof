@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 
 	dynamicstruct "github.com/Ompluscator/dynamic-struct"
 	mysql "github.com/StirlingMarketingGroup/cool-mysql"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/fatih/color"
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/posener/cmd"
@@ -27,6 +29,7 @@ import (
 	"github.com/vbauerster/mpb/v8/decor"
 	"golang.design/x/clipboard"
 	"golang.org/x/mod/semver"
+	"golang.org/x/sync/errgroup"
 )
 
 const modulePath = "github.com/StirlingMarketingGroup/swoof"
@@ -471,8 +474,13 @@ func main() {
 
 		var bar *mpb.Bar
 		if !*noProgressBars {
-			// our pretty bar config for the progress bars
-			// their documentation lives over here https://github.com/vbauerster/mpb
+			// Counters and rate are rendered as "1.1K / 1.6M" via formatShort —
+			// raw row counts were readable but required mental parsing.
+			// Rate = cumulative rows ÷ elapsed since the bar was created, tracked
+			// locally so we can run the value through formatShort. Using our own
+			// clock rather than decor.AverageSpeed's internal one also means retry
+			// resets (bar.SetCurrent(0)) behave consistently.
+			tableStart := time.Now()
 			bar = p.New(0,
 				mpb.BarStyle(),
 				mpb.PrependDecorators(
@@ -480,15 +488,27 @@ func main() {
 					decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
 				),
 				mpb.AppendDecorators(
-					decor.CountersNoUnit("( "+color.HiCyanString("%d/%d")+", "),
-					decor.EwmaSpeed(-1, " "+color.HiGreenString("%.2f/s")+" ) ", 30),
-					decor.EwmaETA(decor.ET_STYLE_GO, 30),
+					decor.Any(func(s decor.Statistics) string {
+						return "( " + color.HiCyanString(formatShort(s.Current)+"/"+formatShort(s.Total)) + ", "
+					}),
+					decor.Any(func(s decor.Statistics) string {
+						elapsed := time.Since(tableStart).Seconds()
+						var rate int64
+						if elapsed > 0 {
+							rate = int64(float64(s.Current) / elapsed)
+						}
+						return " " + color.HiGreenString(formatShort(rate)+"/s") + " ) "
+					}),
+					decor.AverageETA(decor.ET_STYLE_GO),
+					decor.Name(" | "),
+					decor.Elapsed(decor.ET_STYLE_GO, decor.WC{C: decor.DindentRight}),
 				),
 			)
 		}
 
 		go func() {
 			defer wg.Done()
+			defer func() { <-guard }()
 
 			// compute the per-table destination, applying WriterWithSubdir for file dests
 			tableDsts := make([]*mysql.Database, len(dsts))
@@ -499,396 +519,483 @@ func main() {
 				}
 			}
 
-			// once this function is done, let another task take a place
-			// in our guard
-			defer func() { <-guard }()
+			tempTableName := *tempTablePrefix + tableName
 
-			// the mysql lib we're using, cool mysql, lets us define a
-			// chan of structs to read our rows into, for awesome
-			// performance and type safety. The tags are the actual column names
-			columns := make(chan struct {
-				ColumnName           string `mysql:"COLUMN_NAME"`
-				Position             int    `mysql:"ORDINAL_POSITION"`
-				DataType             string `mysql:"DATA_TYPE"`
-				ColumnType           string `mysql:"COLUMN_TYPE"`
-				GenerationExpression string `mysql:"GENERATION_EXPRESSION"`
-			})
+			attempt := 0
 
-			// in this query we're simply getting all the details about our column names
-			// so we can make a dynamic struct that the rows can fit into
-			go func() {
-				defer close(columns)
-				// select every column even though it's evil.
+			// One attempt at importing this table. On any error we let the retry wrapper
+			// above decide whether to drop the orphaned temp table and go again. Safe to
+			// retry because the real table is only swapped in by the delayed finalization
+			// pass, which only runs after the attempt completes without error.
+			runOnce := func() (struct{}, error) {
+				attempt++
+				if attempt > 1 {
+					slog.Warn("retrying table import",
+						"tableName", tableName,
+						"attempt", attempt)
+					// Roll back any partial temp table before retrying — a previous
+					// attempt may have created it but died mid-insert.
+					for _, dst := range tableDsts {
+						if !*dryRyn {
+							if err := dst.Exec("drop table if exists`" + tempTableName + "`"); err != nil {
+								return struct{}{}, backoff.Permanent(fmt.Errorf("retry cleanup drop %q: %w", tempTableName, err))
+							}
+						}
+					}
+					if bar != nil {
+						bar.SetCurrent(0)
+					}
+				}
+
+				// Per-attempt source connection: a fresh *sql.DB pool per try. Each
+				// table goroutine gets its own pool so concurrent streaming cursors
+				// and metadata queries don't fight each other (the "busy" bug under
+				// -t > 1). Doing the open inside runOnce — rather than once per
+				// outer goroutine — means NewFromDSN / Ping failures (transient
+				// network, max_connections bursts) also go through the retry loop.
+				srcTable, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
+				if err != nil {
+					return struct{}{}, fmt.Errorf("open source connection for %q: %w", tableName, err)
+				}
+				defer func() {
+					if err := srcTable.Close(); err != nil {
+						slog.Warn("failed to close per-attempt source pool", "error", err, "tableName", tableName)
+					}
+				}()
+				// Disable SetConnMaxLifetime on the per-table pool. cool-mysql's default
+				// (27s, Lambda-oriented) would needlessly recycle otherwise-healthy
+				// connections mid-stream on multi-hour table imports.
+				srcTable.SetMaxConnectionTime(0)
+				srcTable.DisableUnusedColumnWarnings = true
+				if src.Log != nil {
+					srcTable.Log = src.Log
+				}
+
+				columns := make(chan struct {
+					ColumnName           string `mysql:"COLUMN_NAME"`
+					Position             int    `mysql:"ORDINAL_POSITION"`
+					DataType             string `mysql:"DATA_TYPE"`
+					ColumnType           string `mysql:"COLUMN_TYPE"`
+					GenerationExpression string `mysql:"GENERATION_EXPRESSION"`
+				})
+
+				// Stream column metadata so we can build the row struct before the
+				// full row stream starts. Deliberately NOT part of the downstream
+				// errgroup — if it were, the metadata goroutine's defer close(columns)
+				// would race the errgroup's async ctx cancellation. The drain loop
+				// could see the channel closed before ctx was cancelled, slip past
+				// any ctx.Err() check, and run destination DDL on a failed metadata
+				// fetch. Explicit error channel + synchronous wait eliminates that race.
+				//
 				// `GENERATION_EXPRESSION` sometimes exists and sometimes doesn't, so we can't select for it.
 				// You MAY be able to check the `INFORMATION_SCHEMA` table for column info on `INFORMATION_SCHEMA` itself
 				// but Aurora MySQL doesn't seem to have values for this, unlike regular MySQL.
-				err := src.Select(columns, "select*"+
-					"from`INFORMATION_SCHEMA`.`columns`"+
-					"where`TABLE_SCHEMA`=database()"+
-					"and`table_name`='"+tableName+"'"+
-					"order by`ORDINAL_POSITION`", 0)
-				if err != nil {
-					slog.Error("failed to select columns", "error", err, "tableName", tableName)
-					os.Exit(1)
-				}
-			}()
-
-			// this is our dynamic struct of the actual row, which will have
-			// properties added to it for each column in the following loop
-			rowStruct := dynamicstruct.NewStruct()
-
-			// this is our string builder for quoted column names,
-			// which will be used in our select statement
-			columnsQuotedBld := new(strings.Builder)
-
-			i := 0
-
-			// read c from our channel of columns, where c is our column struct
-			// cool thing about cool mysql channel selecting, is that the selected row
-			// only exists in memory during its loop here, only one at a time
-			for c := range columns {
-				// you can't insert into generated columns, and mysql will actually
-				// throw errors if you try and do this, so we simply skip them altogether
-				// and imagine they don't exist
-				if len(c.GenerationExpression) != 0 {
-					continue
-				}
-
-				// column string should be like "`Column1`,`Column2`..."
-				if i != 0 {
-					columnsQuotedBld.WriteByte(',')
-				}
-				columnsQuotedBld.WriteByte('`')
-				columnsQuotedBld.WriteString(c.ColumnName)
-				columnsQuotedBld.WriteByte('`')
-
-				// column type will end with "unsigned" if the unsigned flag is set for
-				// this column, used for unsigned integers
-				unsigned := strings.HasSuffix(c.ColumnType, "unsigned")
-
-				// these are our struct fields, which all look like "F0", "F1", etc
-				f := "F" + strconv.Itoa(c.Position)
-
-				// create the tag for the field with the exact column name so that
-				// cool mysql insert func knows how to map the row values
-				tag := `mysql:"` + strings.ReplaceAll(c.ColumnName, `,`, `0x2C`) + `"`
-
-				var v any
-
-				// the switch through data types (different than column types, doesn't include lengths)
-				// to determine the type of our struct field
-				// All of the field types are pointers so that our mysql scanning
-				// handles null values gracefully
-				switch c.DataType {
-				case "tinyint":
-					if unsigned {
-						v = new(uint8)
-					} else {
-						v = new(int8)
-					}
-				case "smallint":
-					if unsigned {
-						v = new(uint16)
-					} else {
-						v = new(int16)
-					}
-				case "int", "mediumint":
-					if unsigned {
-						v = new(uint32)
-					} else {
-						v = new(int32)
-					}
-				case "bigint":
-					if unsigned {
-						v = new(uint64)
-					} else {
-						v = new(int64)
-					}
-				case "float", "double":
-					v = new(float64)
-				case "decimal":
-					// our cool mysql literal is exactly what it sounds like;
-					// passed directly into the query with no escaping, which is know is
-					// safe here because a decimal from mysql can't contain breaking characters
-					v = new(mysql.Raw)
-				case "timestamp", "date", "datetime":
-					v = new(string)
-				case "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob":
-					v = new([]byte)
-				case "char", "varchar", "text", "tinytext", "mediumtext", "longtext", "enum":
-					v = new(string)
-				case "json":
-					// the json type here is important, because mysql needs
-					// char set info for json columns, since json is supposed to be utf8,
-					// and go treats this is bytes for some reason. Using json.RawMessag lets cool mysql
-					// know to surround the inlined value with charset info
-					v = new(json.RawMessage)
-				case "set":
-					v = new(any)
-				default:
-					slog.Error("unknown mysql column type", "columnType", c.ColumnType, "columnName", c.ColumnName, "tableName", tableName)
-					os.Exit(1)
-				}
-
-				rowStruct.AddField(f, v, tag)
-
-				i++
-			}
-
-			// this gets the "type" of our struct from our dynamic struct
-			structType := reflect.Indirect(reflect.ValueOf(rowStruct.Build().New())).Type()
-			columnsQuoted := columnsQuotedBld.String()
-
-			// source channel — data is read once and fanned out to all dests
-			srcChRef := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize)
-
-			if !*skipData {
-				// oh yeah, that's just one query. We don't actually have to chunk this selection
-				// because we're dealing with rows as they come in, instead of trying to select them
-				// all into memory or something first, which makes this code dramatically simpler
-				// and should work with tables of all sizes
+				columnsErrCh := make(chan error, 1)
 				go func() {
-					defer srcChRef.Close()
-
-					q := "select /*+ MAX_EXECUTION_TIME(2147483647) */ " + columnsQuoted + "from`" + tableName + "`"
-					if *whereClause != "" {
-						q += " where " + *whereClause + " "
-					}
-					err := src.Select(srcChRef.Interface(), q, 0)
-					if err != nil {
-						slog.Error("failed to select rows", "error", err, "tableName", tableName, "columnsQuoted", columnsQuoted)
-						os.Exit(1)
-					}
+					defer close(columns)
+					columnsErrCh <- srcTable.SelectContext(context.Background(), columns, "select*"+
+						"from`INFORMATION_SCHEMA`.`columns`"+
+						"where`TABLE_SCHEMA`=database()"+
+						"and`table_name`='"+tableName+"'"+
+						"order by`ORDINAL_POSITION`", 0)
 				}()
-			}
 
-			var count int64
-			if !*skipData && !*noProgressBars && !*skipCount {
-				// and get the count, so we can show are swick progress bars
-				countQ := "select count(*)`Count`from`" + tableName + "`"
-				if *whereClause != "" {
-					countQ += " where " + *whereClause + " "
-				}
-				err := src.Select(&count, countQ, 0)
-				if err != nil {
-					slog.Error("failed to get row count", "error", err, "tableName", tableName)
-					os.Exit(1)
-				}
+				rowStruct := dynamicstruct.NewStruct()
+				columnsQuotedBld := new(strings.Builder)
+				i := 0
 
-				bar.SetTotal(count, false)
-			}
-
-			var tempTableName string
-
-			if !*insertIgnoreInto {
-				// now we get the table creation syntax from our source
-				var table struct {
-					CreateMySQL string `mysql:"Create Table"`
-				}
-				err := src.Select(&table, "show create table`"+tableName+"`", 0)
-				if err != nil {
-					slog.Error("failed to select table creation syntax", "error", err, "tableName", tableName)
-					os.Exit(1)
-				}
-
-				tempTableName = *tempTablePrefix + tableName
-
-				// since foreign key constraints have globally unique names (for some reason)
-				// we can't just create our temp table with constraints because
-				// the names will likely conflict with the table that already exists
-
-				// so we will strip the constraints here and add them back once we're done
-				var constraints string
-
-				// we can safely assume the constraints start like this because you can't
-				// constraints without columns!
-				constraintsStart := strings.Index(table.CreateMySQL, ",\n  CONSTRAINT ")
-				if constraintsStart != -1 {
-					// we have the start of our constraints block, and since mysql
-					// always (hopefully) gives them in a block, we can find the last
-					// constraint and everything in the middle is what we want
-					constraintsEnd := strings.LastIndex(table.CreateMySQL, ",\n  CONSTRAINT ")
-
-					// but we need the end of the line, so we'll get the byte index of the newline
-					// after our last index as our end marker
-					constraintsEnd = constraintsEnd + strings.IndexByte(table.CreateMySQL[constraintsEnd+2:], '\n') + 2
-
-					// then we can keep track of our constraints so we can add them back
-					// to our table once we've dropped the original table
-					constraints = table.CreateMySQL[constraintsStart:constraintsEnd]
-
-					// and store our create query without our constraints
-					table.CreateMySQL = table.CreateMySQL[:constraintsStart] + table.CreateMySQL[constraintsEnd:]
-				}
-
-				createSuffix := strings.TrimPrefix(table.CreateMySQL, "CREATE TABLE `"+tableName+"`")
-
-				// create the temp table on every destination
-				for _, dst := range tableDsts {
-					if !*dryRyn {
-						// delete the table from our destination
-						if err := dst.Exec("drop table if exists`" + tempTableName + "`"); err != nil {
-							slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
-							os.Exit(1)
-						}
-
-						// now we can make the table on our destination
-						if err := dst.Exec("CREATE TABLE `" + tempTableName + "`" + createSuffix); err != nil {
-							slog.Error("failed to create table on destination", "error", err, "tableName", tempTableName)
-							os.Exit(1)
-						}
+				// Drain columns into the dynamic row struct. Cool mysql channel
+				// selecting keeps only one row in memory at a time.
+				for c := range columns {
+					if len(c.GenerationExpression) != 0 {
+						// You can't insert into generated columns, and mysql will actually
+						// throw errors if you try. Skip them entirely.
+						continue
 					}
+
+					if i != 0 {
+						columnsQuotedBld.WriteByte(',')
+					}
+					columnsQuotedBld.WriteByte('`')
+					columnsQuotedBld.WriteString(c.ColumnName)
+					columnsQuotedBld.WriteByte('`')
+
+					unsigned := strings.HasSuffix(c.ColumnType, "unsigned")
+
+					f := "F" + strconv.Itoa(c.Position)
+					tag := `mysql:"` + strings.ReplaceAll(c.ColumnName, `,`, `0x2C`) + `"`
+
+					var v any
+
+					// All field types are pointers so mysql scanning handles NULL gracefully.
+					switch c.DataType {
+					case "tinyint":
+						if unsigned {
+							v = new(uint8)
+						} else {
+							v = new(int8)
+						}
+					case "smallint":
+						if unsigned {
+							v = new(uint16)
+						} else {
+							v = new(int16)
+						}
+					case "int", "mediumint":
+						if unsigned {
+							v = new(uint32)
+						} else {
+							v = new(int32)
+						}
+					case "bigint":
+						if unsigned {
+							v = new(uint64)
+						} else {
+							v = new(int64)
+						}
+					case "float", "double":
+						v = new(float64)
+					case "decimal":
+						// mysql.Raw is passed directly into the query with no escaping;
+						// safe here because a decimal from mysql can't contain breaking characters.
+						v = new(mysql.Raw)
+					case "timestamp", "date", "datetime":
+						v = new(string)
+					case "binary", "varbinary", "blob", "tinyblob", "mediumblob", "longblob":
+						v = new([]byte)
+					case "char", "varchar", "text", "tinytext", "mediumtext", "longtext", "enum":
+						v = new(string)
+					case "json":
+						// json.RawMessage lets cool mysql surround the value with charset info,
+						// since mysql needs utf8 charset info for json columns.
+						v = new(json.RawMessage)
+					case "set":
+						v = new(any)
+					default:
+						// Unknown column types are not transient — fail permanently so we
+						// don't spin through retries on a schema shape we can't handle.
+						// Drain remaining columns so the streaming goroutine can finish and
+						// close its channel cleanly, then surface the error.
+						for range columns {
+						}
+						<-columnsErrCh
+						return struct{}{}, backoff.Permanent(fmt.Errorf("unknown mysql column type %q for column %q on table %q", c.ColumnType, c.ColumnName, tableName))
+					}
+
+					rowStruct.AddField(f, v, tag)
+					i++
 				}
 
-				// one delayed func per table that finalizes all dests
-				delayedFuncs <- func() {
+				// Synchronously collect the columns goroutine's result before any
+				// destination DDL runs — this is the fix for the close/ctx race.
+				if err := <-columnsErrCh; err != nil {
+					return struct{}{}, fmt.Errorf("select columns for %q: %w", tableName, err)
+				}
+
+				structType := reflect.Indirect(reflect.ValueOf(rowStruct.Build().New())).Type()
+				columnsQuoted := columnsQuotedBld.String()
+
+				// errgroup scopes the row-stream, fan-out, and per-dest insert
+				// goroutines for this attempt. First error cancels ctx so everyone
+				// unwinds; g.Wait() returns the first error.
+				g, ctx := errgroup.WithContext(context.Background())
+
+				var count int64
+				if !*skipData && !*noProgressBars && !*skipCount {
+					countQ := "select count(*)`Count`from`" + tableName + "`"
+					if *whereClause != "" {
+						countQ += " where " + *whereClause + " "
+					}
+					if err := srcTable.SelectContext(ctx, &count, countQ, 0); err != nil {
+						return struct{}{}, fmt.Errorf("count rows for %q: %w", tableName, err)
+					}
+					bar.SetTotal(count, false)
+				}
+
+				// Build the finalization closure during the attempt but do NOT push it
+				// to delayedFuncs until the attempt actually succeeds — otherwise a
+				// failed+retried table would have two entries.
+				var onSuccess func()
+
+				if !*insertIgnoreInto {
+					var tableInfo struct {
+						CreateMySQL string `mysql:"Create Table"`
+					}
+					if err := srcTable.SelectContext(ctx, &tableInfo, "show create table`"+tableName+"`", 0); err != nil {
+						return struct{}{}, fmt.Errorf("show create table %q: %w", tableName, err)
+					}
+
+					// FK constraints have globally unique names, so creating the temp table
+					// with them inline would collide with the already-existing real table.
+					// Strip them out here and re-apply after the rename.
+					var constraints string
+
+					constraintsStart := strings.Index(tableInfo.CreateMySQL, ",\n  CONSTRAINT ")
+					if constraintsStart != -1 {
+						// MySQL always gives constraints as a contiguous block, so locate
+						// the last one and treat everything between as the constraint block.
+						constraintsEnd := strings.LastIndex(tableInfo.CreateMySQL, ",\n  CONSTRAINT ")
+						constraintsEnd = constraintsEnd + strings.IndexByte(tableInfo.CreateMySQL[constraintsEnd+2:], '\n') + 2
+						constraints = tableInfo.CreateMySQL[constraintsStart:constraintsEnd]
+						tableInfo.CreateMySQL = tableInfo.CreateMySQL[:constraintsStart] + tableInfo.CreateMySQL[constraintsEnd:]
+					}
+
+					createSuffix := strings.TrimPrefix(tableInfo.CreateMySQL, "CREATE TABLE `"+tableName+"`")
+
 					for _, dst := range tableDsts {
-						// drop the old table now that our temp table is done
 						if !*dryRyn {
-							if err := dst.Exec("drop table if exists`" + tableName + "`"); err != nil {
-								slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
-								os.Exit(1)
+							if err := dst.Exec("drop table if exists`" + tempTableName + "`"); err != nil {
+								return struct{}{}, fmt.Errorf("drop temp table %q: %w", tempTableName, err)
 							}
-						}
-
-						// rename our temp table to the real table name
-						// we could do an atomic rename here, but the problem is that atomic renames
-						// also rename all the constraints of other tables pointing to our original table, and
-						// we want those constraints to point to our new table instead
-
-						// if you're doing this live, there *is* some down time, but other tools handle this the same
-						// way, so I don't think it's unreasonable if we do the same
-						if !*dryRyn {
-							if err := dst.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`"); err != nil {
-								slog.Error("failed to rename table", "error", err, "from", tempTableName, "to", tableName)
-								os.Exit(1)
-							}
-						}
-
-						// no we can add back our constraints if we have them
-						// converting our constraints to alter table syntax by removing our leading
-						// comma and adding the word "add" at the beginning of each line
-						if len(constraints) != 0 && !*dryRyn {
-							if err := dst.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd")); err != nil {
-								slog.Warn("failed to add constraints to table", "error", err, "tableName", tableName)
+							if err := dst.Exec("CREATE TABLE `" + tempTableName + "`" + createSuffix); err != nil {
+								return struct{}{}, fmt.Errorf("create temp table %q: %w", tempTableName, err)
 							}
 						}
 					}
 
-					// triggers are read from source once and applied to all dests
-					triggers := make(chan struct {
-						Trigger string
-					})
-					go func() {
-						defer close(triggers)
-						if err := src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0); err != nil {
-							slog.Error("failed to select triggers", "error", err, "tableName", tableName)
-							os.Exit(1)
-						}
-					}()
-					for r := range triggers {
-						var trigger struct {
-							CreateMySQL string `mysql:"SQL Original Statement"`
-						}
-						if err := src.Select(&trigger, "show create trigger`"+r.Trigger+"`", 0); err != nil {
-							slog.Error("failed to select trigger creation syntax", "error", err, "trigger", r.Trigger, "tableName", tableName)
-							os.Exit(1)
-						}
-
-						// we need to remove the definer from the trigger
-						// because the definer is the user that created the trigger
-						// and that user may not exist on the destination
-						trigger.CreateMySQL = definerRegexp.ReplaceAllString(trigger.CreateMySQL, "")
-
-						if !*dryRyn {
+					onSuccess = func() {
+						// Queued to run after all tables finish importing. Renames the temp
+						// table over the real one, re-adds constraints, and copies triggers.
+						delayedFuncs <- func() {
 							for _, dst := range tableDsts {
-								if err := dst.Exec(trigger.CreateMySQL); err != nil {
-									slog.Error("failed to execute trigger creation SQL", "error", err, "trigger", r.Trigger, "tableName", tableName)
+								if !*dryRyn {
+									if err := dst.Exec("drop table if exists`" + tableName + "`"); err != nil {
+										slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
+										os.Exit(1)
+									}
+								}
+
+								// Non-atomic rename on purpose — atomic would also rename
+								// other tables' FK references to point at the old name.
+								// Small downtime on live dest is the accepted tradeoff.
+								if !*dryRyn {
+									if err := dst.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`"); err != nil {
+										slog.Error("failed to rename table", "error", err, "from", tempTableName, "to", tableName)
+										os.Exit(1)
+									}
+								}
+
+								if len(constraints) != 0 && !*dryRyn {
+									if err := dst.Exec("alter table`" + tableName + "`" + strings.ReplaceAll(strings.TrimLeft(constraints, ","), "\n", "\nadd")); err != nil {
+										slog.Warn("failed to add constraints to table", "error", err, "tableName", tableName)
+									}
+								}
+							}
+
+							// Triggers: copy from the source (top-level src, since per-table
+							// pool is already closed by the time delayed funcs run) to every dest.
+							triggers := make(chan struct {
+								Trigger string
+							})
+							go func() {
+								defer close(triggers)
+								if err := src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0); err != nil {
+									slog.Error("failed to select triggers", "error", err, "tableName", tableName)
 									os.Exit(1)
+								}
+							}()
+							for r := range triggers {
+								var trigger struct {
+									CreateMySQL string `mysql:"SQL Original Statement"`
+								}
+								if err := src.Select(&trigger, "show create trigger`"+r.Trigger+"`", 0); err != nil {
+									slog.Error("failed to select trigger creation syntax", "error", err, "trigger", r.Trigger, "tableName", tableName)
+									os.Exit(1)
+								}
+
+								// Strip DEFINER — the definer user may not exist on dest.
+								trigger.CreateMySQL = definerRegexp.ReplaceAllString(trigger.CreateMySQL, "")
+
+								if !*dryRyn {
+									for _, dst := range tableDsts {
+										if err := dst.Exec(trigger.CreateMySQL); err != nil {
+											slog.Error("failed to execute trigger creation SQL", "error", err, "trigger", r.Trigger, "tableName", tableName)
+											os.Exit(1)
+										}
+									}
 								}
 							}
 						}
 					}
 				}
-			}
 
-			if *noProgressBars {
-				slog.Info("importing table", "tableName", tableName)
-			}
-
-			if !*skipData && !*dryRyn {
-				insertPrefix := "insert into`" + tempTableName + "`"
-				if *insertIgnoreInto {
-					insertPrefix = "insert ignore into`" + tableName + "`"
+				if *noProgressBars && attempt == 1 {
+					slog.Info("importing table", "tableName", tableName)
 				}
 
-				if len(dsts) == 1 {
-					// single destination: use the source channel directly — zero overhead
-					inserter := tableDsts[0].I()
-
-					if !*noProgressBars {
-						inserter = inserter.SetAfterRowExec(func(start time.Time) {
-							bar.EwmaIncrement(time.Since(start))
-						})
+				if !*skipData && !*dryRyn {
+					insertPrefix := "insert into`" + tempTableName + "`"
+					if *insertIgnoreInto {
+						insertPrefix = "insert ignore into`" + tableName + "`"
 					}
 
-					if err := inserter.Insert(insertPrefix, srcChRef.Interface()); err != nil {
-						slog.Error("failed to insert rows into destination", "error", err, "tableName", tableName)
-						os.Exit(1)
-					}
-				} else {
-					// multiple destinations: fan out each row from the single source
-					// channel to per-destination channels so the source is read only once
-					dstChRefs := make([]reflect.Value, len(dsts))
-					for i := range dsts {
-						dstChRefs[i] = reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize)
-					}
+					// Source channel — data is read once and fanned out to all dests.
+					// Spawned here, AFTER every synchronous setup step (count, show
+					// create, temp-table DDL) has succeeded. If we started the stream
+					// any earlier, a pre-insert failure would return without calling
+					// g.Wait(), leaving the producer goroutine blocked sending into a
+					// buffer nobody drains and holding a source connection across the
+					// retry — a leak the reviewer caught.
+					srcChRef := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize)
 
-					go func() {
-						defer func() {
-							for _, ref := range dstChRefs {
-								ref.Close()
-							}
-						}()
-						for {
-							val, ok := srcChRef.Recv()
-							if !ok {
-								return
-							}
-							for _, ref := range dstChRefs {
-								ref.Send(val)
-							}
+					g.Go(func() error {
+						defer srcChRef.Close()
+
+						q := "select /*+ MAX_EXECUTION_TIME(2147483647) */ " + columnsQuoted + "from`" + tableName + "`"
+						if *whereClause != "" {
+							q += " where " + *whereClause + " "
 						}
-					}()
+						if err := srcTable.SelectContext(ctx, srcChRef.Interface(), q, 0); err != nil {
+							return fmt.Errorf("select rows for %q: %w", tableName, err)
+						}
+						return nil
+					})
 
-					var insertWg sync.WaitGroup
-					for i := range dsts {
-						insertWg.Add(1)
-						go func(i int) {
-							defer insertWg.Done()
-
-							inserter := tableDsts[i].I()
-
-							// track progress from the first destination only
-							if i == 0 && !*noProgressBars {
+					if len(dsts) == 1 {
+						// Single destination: consume source channel directly.
+						g.Go(func() error {
+							inserter := tableDsts[0].I()
+							if !*noProgressBars {
 								inserter = inserter.SetAfterRowExec(func(start time.Time) {
 									bar.EwmaIncrement(time.Since(start))
 								})
 							}
-
-							if err := inserter.Insert(insertPrefix, dstChRefs[i].Interface()); err != nil {
-								slog.Error("failed to insert rows into destination", "error", err, "tableName", tableName)
-								os.Exit(1)
+							if err := inserter.InsertContext(ctx, insertPrefix, srcChRef.Interface()); err != nil {
+								return fmt.Errorf("insert into %q: %w", tableName, err)
 							}
-						}(i)
+							return nil
+						})
+					} else {
+						// Multiple destinations: fan out each row from the single source
+						// channel to per-dest channels so the source is read only once.
+						dstChRefs := make([]reflect.Value, len(dsts))
+						for j := range dsts {
+							dstChRefs[j] = reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize)
+						}
+
+						g.Go(func() error {
+							defer func() {
+								for _, ref := range dstChRefs {
+									ref.Close()
+								}
+							}()
+							doneRef := reflect.ValueOf(ctx.Done())
+							for {
+								// Recv with ctx cancellation awareness.
+								recvCases := []reflect.SelectCase{
+									{Dir: reflect.SelectRecv, Chan: srcChRef},
+									{Dir: reflect.SelectRecv, Chan: doneRef},
+								}
+								chosen, val, ok := reflect.Select(recvCases)
+								if chosen == 1 {
+									return ctx.Err()
+								}
+								if !ok {
+									return nil
+								}
+								// Send to each dest channel with ctx cancellation awareness —
+								// otherwise a downed insert goroutine that stopped receiving
+								// would deadlock the fan-out.
+								for _, ref := range dstChRefs {
+									sendCases := []reflect.SelectCase{
+										{Dir: reflect.SelectSend, Chan: ref, Send: val},
+										{Dir: reflect.SelectRecv, Chan: doneRef},
+									}
+									if chosen, _, _ := reflect.Select(sendCases); chosen == 1 {
+										return ctx.Err()
+									}
+								}
+							}
+						})
+
+						for j := range dsts {
+							g.Go(func() error {
+								inserter := tableDsts[j].I()
+								// Track progress from the first destination only.
+								if j == 0 && !*noProgressBars {
+									inserter = inserter.SetAfterRowExec(func(start time.Time) {
+										bar.EwmaIncrement(time.Since(start))
+									})
+								}
+								if err := inserter.InsertContext(ctx, insertPrefix, dstChRefs[j].Interface()); err != nil {
+									return fmt.Errorf("insert into %q (dest %d): %w", tableName, j, err)
+								}
+								return nil
+							})
+						}
 					}
-					insertWg.Wait()
 				}
+
+				if err := g.Wait(); err != nil {
+					return struct{}{}, err
+				}
+
+				// All streams and inserts succeeded — queue the finalization closure.
+				if onSuccess != nil {
+					onSuccess()
+				}
+
+				return struct{}{}, nil
+			}
+
+			// Retry wrapper. Transient errors (network blip, pool "busy" state, server
+			// hiccup) cause a full table reload from scratch. Non-transient errors
+			// (schema shape, syntax) are wrapped as backoff.Permanent inside runOnce
+			// and short-circuit the loop.
+			bop := backoff.NewExponentialBackOff()
+			bop.InitialInterval = 1 * time.Second
+			bop.MaxInterval = 30 * time.Second
+
+			wrappedOp := func() (struct{}, error) {
+				v, err := runOnce()
+				if err == nil {
+					return v, nil
+				}
+				// Already marked permanent inside runOnce — surface as-is.
+				var perm *backoff.PermanentError
+				if stderrors.As(err, &perm) {
+					return v, err
+				}
+				// -insert-ignore writes directly to the real table with no temp
+				// staging, so retrying after a partial first attempt would double-
+				// insert rows on tables without a unique key (and leave partial
+				// first-attempt rows behind even on tables with one). Retries are
+				// only safe with the temp-table swap pattern.
+				if *insertIgnoreInto {
+					return v, backoff.Permanent(err)
+				}
+				if !isTransientError(err) {
+					return v, backoff.Permanent(err)
+				}
+				slog.Warn("transient table import error, will retry",
+					"tableName", tableName,
+					"attempt", attempt,
+					"error", err,
+					"chain", formatErrorChain(err))
+				return v, err
+			}
+
+			if _, err := backoff.Retry(context.Background(), wrappedOp,
+				backoff.WithBackOff(bop),
+				backoff.WithMaxTries(5),
+			); err != nil {
+				// Strip any *backoff.PermanentError wrapper so the log shows the
+				// underlying cause directly.
+				inner := err
+				var perm *backoff.PermanentError
+				if stderrors.As(err, &perm) {
+					inner = perm.Err
+				}
+				slog.Error("table import failed after retries",
+					"error", inner,
+					"chain", formatErrorChain(inner),
+					"tableName", tableName,
+					"attempts", attempt)
+				os.Exit(1)
 			}
 
 			if !*noProgressBars {
-				// and just in case the rows have changed count since our count selection,
-				// we'll just tell the progress bar that we're finished
+				// In case row count drifted between the count query and the stream.
 				bar.SetTotal(bar.Current(), true)
 			}
 		}()
