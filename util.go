@@ -16,14 +16,18 @@ import (
 )
 
 // ensureUTCSession injects time_zone='+00:00' into the DSN's params if the
-// user hasn't set one explicitly. go-sql-driver treats unknown DSN params as
-// session system variables and runs the corresponding SET on every new
-// connection its pool opens, so every conn comes up anchored to UTC. Without
-// this, schema replay breaks against servers whose default session tz isn't
-// UTC: SHOW CREATE TABLE emits timestamp defaults rendered in the source
-// session tz, the dest parses them in its own session tz, and the round-trip
-// shifts boundary values (e.g. TIMESTAMP(6)'s max 2038-01-19 03:14:07.999999)
-// past the signed-32-bit seconds range, 1067'ing the CREATE.
+// user hasn't set one explicitly, so every conn the pool opens comes up with
+// its session tz anchored to UTC (go-sql-driver runs SET on unknown DSN
+// params as part of each new conn's init).
+//
+// Both sides of a swoof run must agree on session tz or schema replay breaks.
+// MySQL stores TIMESTAMP defaults as UTC internally, SHOW CREATE TABLE
+// renders them in the source's session tz, and the destination parses that
+// literal in its own session tz before converting back to UTC for storage.
+// When the two tzs differ, the round-trip shifts boundary values — notably
+// TIMESTAMP(6)'s 2038-01-19 03:14:07.999999 max — past the signed-32-bit
+// seconds range, and strict MySQL rejects the CREATE with ER_INVALID_DEFAULT.
+// Anchoring both sides to UTC makes the round-trip identity.
 func ensureUTCSession(dsn string) (string, error) {
 	cfg, err := mysqldriver.ParseDSN(dsn)
 	if err != nil {
