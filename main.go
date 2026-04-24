@@ -234,6 +234,15 @@ func main() {
 		}
 	}
 
+	// Anchor the source session to UTC so SHOW CREATE TABLE emits timestamp
+	// defaults (e.g. TIMESTAMP's 2038-01-19 03:14:07.999999 max) in UTC rather
+	// than rendered into whatever tz the server defaulted to.
+	sourceDSN, err := ensureUTCSession(sourceDSN)
+	if err != nil {
+		slog.Error("failed to apply UTC session tz to source DSN", "error", err)
+		os.Exit(1)
+	}
+
 	// source connection is the first argument
 	// this is where our rows are coming from
 	src, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
@@ -382,6 +391,15 @@ func main() {
 				os.Exit(1)
 			}
 		} else {
+			// Anchor every dest pool conn to UTC, matching the source. Without
+			// this a non-UTC dest session reinterprets the SHOW CREATE TABLE
+			// output from the source, shifting boundary timestamp defaults past
+			// the 32-bit seconds range and 1067'ing on CREATE.
+			destDSN, err = ensureUTCSession(destDSN)
+			if err != nil {
+				slog.Error("failed to apply UTC session tz to destination DSN", "error", err, "destinationDSN", friendlyName)
+				os.Exit(1)
+			}
 			db, err = mysql.NewFromDSN(destDSN, destDSN)
 			if err != nil {
 				slog.Error("failed to create destination connection", "error", err, "destinationDSN", destDSN)
