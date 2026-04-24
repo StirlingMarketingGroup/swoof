@@ -123,7 +123,12 @@ func formatShort(n int64) string {
 
 	var buf [24]byte
 	out := strconv.AppendInt(buf[:0], whole, 10)
-	out = append(out, '.', byte('0'+tenth), suffix)
+	// At 100+ units we drop the decimal so the string stays 3 digits wide in
+	// the suffix bucket (e.g. 99.9K → 100K rather than 100.0K).
+	if whole < 100 {
+		out = append(out, '.', byte('0'+tenth))
+	}
+	out = append(out, suffix)
 	return string(out)
 }
 
@@ -170,6 +175,29 @@ func extractErrorStack(err error) string {
 		return ""
 	}
 	return fmt.Sprintf("%+v", innermost)
+}
+
+// rootErrorMsg returns the innermost error's message (unwrapped), trimmed to
+// the first line. Used for the compact `cause` attr on transient retry
+// warnings and for the TUI's per-row state text, where a several-kilobyte
+// wrapped cool-mysql error would otherwise overflow. The full chain is still
+// emitted alongside on a final (permanent) failure.
+func rootErrorMsg(err error) string {
+	if err == nil {
+		return ""
+	}
+	for {
+		next := stderrors.Unwrap(err)
+		if next == nil {
+			break
+		}
+		err = next
+	}
+	msg := err.Error()
+	if i := strings.IndexByte(msg, '\n'); i >= 0 {
+		msg = msg[:i]
+	}
+	return msg
 }
 
 // isTransientError reports whether err is worth retrying a whole-table import for.
