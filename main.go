@@ -176,19 +176,24 @@ func isNewerVersion(latest, current string) bool {
 	return semver.Compare(latestSemver, currentSemver) > 0
 }
 
-func printRunHeader(source string, destinations []string, tables []string) {
+// printTitle prints the top-of-screen banner: `swoof vX.Y.Z - Copyright…`.
+// Emitted before the update-available warning and the "connecting to source"
+// setup lines so the user sees exactly what's running before anything else.
+func printTitle() {
 	_, current := moduleVersion()
 	if current == "" {
 		current = "dev"
 	}
-
 	labelGreen := color.New(color.FgHiGreen).Add(color.Bold).SprintFunc()
+	value := color.New(color.FgHiWhite).SprintFunc()
+	copyrightWithYear := fmt.Sprintf("Copyright © %d Stirling Marketing Group", time.Now().Year())
+	fmt.Printf("%s %s - %s\n\n", labelGreen("swoof"), value(current), value(copyrightWithYear))
+}
+
+func printRunHeader(source string, destinations []string, tables []string) {
 	labelCyan := color.New(color.FgHiCyan).SprintFunc()
 	value := color.New(color.FgHiWhite).SprintFunc()
 
-	copyrightWithYear := fmt.Sprintf("Copyright © %d Stirling Marketing Group", time.Now().Year())
-
-	fmt.Printf("%s %s - %s\n\n", labelGreen("swoof"), value(current), value(copyrightWithYear))
 	fmt.Printf("%s %s\n", labelCyan("source:       "), value(source))
 
 	destLabel := "destination:  "
@@ -294,6 +299,7 @@ func main() {
 		os.Exit(0)
 	}
 
+	printTitle()
 	maybeReportNewVersion()
 
 	if len(*args) < 2 {
@@ -602,6 +608,12 @@ func main() {
 		go u.Run()
 	}
 
+	slog.Info("swoof run started",
+		"source", sourceFriendly,
+		"destinations", destFriendlyNames,
+		"tables", len(orderedTables),
+		"threads", *threads)
+
 	// we need to delay some funcs, most notably the foreign key constraint part.
 	// problem comes from us importing two tables that depend on each other; when
 	// one finishes before the other, if we create the constraints as well, then it will fail
@@ -643,6 +655,7 @@ func main() {
 			}
 
 			tempTableName := *tempTablePrefix + tableName
+			tableStart := time.Now()
 
 			// Safe to retry because the real table is only swapped in by the
 			// delayed finalization pass, which runs after the attempt succeeds.
@@ -919,8 +932,12 @@ func main() {
 					}
 				}
 
-				if !useTUI && attempt == 1 {
-					slog.Info("importing table", "tableName", tableName)
+				if attempt == 1 {
+					if count > 0 {
+						slog.Info("starting table", "tableName", tableName, "rows", count)
+					} else {
+						slog.Info("starting table", "tableName", tableName)
+					}
 				}
 
 				if !*skipData && !*dryRun {
@@ -1104,6 +1121,18 @@ func main() {
 				os.Exit(1)
 			}
 
+			elapsed := time.Since(tableStart).Round(time.Second)
+			if attempts > 1 {
+				slog.Info("recovered after retries",
+					"tableName", tableName,
+					"attempts", attempts,
+					"duration", elapsed)
+			}
+			slog.Info("finished table",
+				"tableName", tableName,
+				"rows", state.Rows(),
+				"duration", elapsed)
+
 			state.Complete()
 		}()
 	}
@@ -1115,20 +1144,31 @@ func main() {
 	}()
 
 	if u != nil {
-		// If the TUI exits before workers finish, the user interrupted via
-		// q or Ctrl+C. Worker goroutines are mid-import against MySQL and
-		// don't observe a shared cancel context, so we force-exit rather
-		// than hang on wg.Wait. Connections get torn down at process exit;
-		// MySQL cleans up the orphaned sessions on its end.
+		// If the TUI exits before workers finish, either the user interrupted
+		// (Ctrl+C / q -> errInterrupted) or a worker hit a permanent failure
+		// and called u.Fatal. We can't gracefully cancel the in-flight workers
+		// (no shared ctx), so force-exit either way; differentiate the message
+		// and exit code based on the recorded firstErr.
 		select {
 		case <-workersDone:
 		case <-u.Done():
 			log.SetOutput(os.Stderr)
-			fmt.Fprintln(os.Stderr, "\nswoof: interrupted")
-			if path := u.LogPath(); path != "" {
-				fmt.Fprintf(os.Stderr, "log: %s\n", path)
+			fatalErr := u.FirstError()
+			path := u.LogPath()
+			if stderrors.Is(fatalErr, errInterrupted) {
+				fmt.Fprintln(os.Stderr, "\nswoof: interrupted")
+				if path != "" {
+					fmt.Fprintf(os.Stderr, "log: %s\n", path)
+				}
+				os.Exit(130)
 			}
-			os.Exit(130)
+			if fatalErr != nil {
+				fmt.Fprintf(os.Stderr, "\nswoof: %v\n", fatalErr)
+			}
+			if path != "" {
+				fmt.Fprintf(os.Stderr, "full log: %s\n", path)
+			}
+			os.Exit(1)
 		}
 
 		// Normal completion: tear down the TUI before the finalization
@@ -1136,6 +1176,11 @@ func main() {
 		// land on real stderr instead of being absorbed by a live tview
 		// screen.
 		fatalErr := u.FirstError()
+		if fatalErr == nil {
+			slog.Info("table imports complete",
+				"tables", tableCount,
+				"duration", time.Since(start).Round(time.Second))
+		}
 		u.Stop()
 		log.SetOutput(os.Stderr)
 		if fatalErr != nil {
