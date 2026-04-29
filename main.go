@@ -7,6 +7,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -26,11 +27,10 @@ import (
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/pkg/errors"
 	"github.com/posener/cmd"
-	"github.com/vbauerster/mpb/v8"
-	"github.com/vbauerster/mpb/v8/decor"
 	"golang.design/x/clipboard"
 	"golang.org/x/mod/semver"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/term"
 )
 
 const modulePath = "github.com/StirlingMarketingGroup/swoof"
@@ -43,7 +43,7 @@ var (
 var (
 	root = cmd.New()
 
-	aliasesFiles = root.String("a", confDir+"/swoof/aliases.yaml", "your alaises file")
+	aliasesFiles = root.String("a", confDir+"/swoof/aliases.yaml", "your aliases file")
 
 	connectionsFile = root.String("c", confDir+"/swoof/connections.yaml", "your connections file")
 
@@ -55,7 +55,7 @@ var (
 
 	insertIgnoreInto = root.Bool("insert-ignore", false, "inserts into the existing table without overwriting the existing rows")
 
-	dryRyn = root.Bool("dry-run", false, "doesn't actually execute any queries that have an effect")
+	dryRun = root.Bool("dry-run", false, "doesn't actually execute any queries that have an effect")
 
 	verbose = root.Bool("v", false, "writes all queries to stdout")
 
@@ -66,6 +66,8 @@ var (
 	procs = root.Bool("procs", false, "imports all stored procedures after tables, funcs, and views")
 
 	noProgressBars = root.Bool("no-progress", false, "disables the progress bars")
+
+	showVersion = root.Bool("version", false, "prints the version and exits")
 
 	skipCount = root.Bool("skip-count", false, "skips the count query for each table, which can be slow for large tables")
 
@@ -136,8 +138,9 @@ func maybeReportNewVersion() {
 		return
 	}
 
-	label := color.New(color.FgHiYellow).Sprint("⚠ update available")
-	fmt.Fprintf(os.Stderr, "%s: swoof %s is available (current %s). https://github.com/StirlingMarketingGroup/swoof/releases/latest\n", label, latestRaw, current)
+	label := color.New(color.FgHiYellow).Sprint("\n⚠ update available")
+	newVersion := color.New(color.FgHiGreen).Add(color.Bold).Sprintf("swoof %s", latestRaw)
+	fmt.Fprintf(os.Stderr, "%s: %s is available!\nhttps://github.com/StirlingMarketingGroup/swoof/releases/latest\n\n", label, newVersion)
 }
 
 func moduleVersion() (string, string) {
@@ -173,6 +176,99 @@ func isNewerVersion(latest, current string) bool {
 	return semver.Compare(latestSemver, currentSemver) > 0
 }
 
+// printTitle prints the top-of-screen banner: `swoof vX.Y.Z - Copyright…`.
+// Emitted before the update-available warning and the "connecting to source"
+// setup lines so the user sees exactly what's running before anything else.
+func printTitle() {
+	_, current := moduleVersion()
+	if current == "" {
+		current = "dev"
+	}
+	labelGreen := color.New(color.FgHiGreen).Add(color.Bold).SprintFunc()
+	value := color.New(color.FgHiWhite).SprintFunc()
+	copyrightWithYear := fmt.Sprintf("Copyright © %d Stirling Marketing Group", time.Now().Year())
+	fmt.Printf("%s %s - %s\n\n", labelGreen("swoof"), value(current), value(copyrightWithYear))
+}
+
+func printRunHeader(source string, destinations []string, tables []string) {
+	labelCyan := color.New(color.FgHiCyan).SprintFunc()
+	value := color.New(color.FgHiWhite).SprintFunc()
+
+	fmt.Printf("%s %s\n", labelCyan("source:       "), value(source))
+
+	destLabel := "destination:  "
+	if len(destinations) > 1 {
+		destLabel = "destinations:"
+	}
+	fmt.Printf("%s %s\n", labelCyan(destLabel), value(strings.Join(destinations, ", ")))
+
+	if len(tables) == 0 {
+		fmt.Printf("%s %s\n", labelCyan("tables:       "), value("none"))
+		return
+	}
+	fmt.Printf("%s %s\n\n", labelCyan("tables:       "), value(fmt.Sprintf("%d total", len(tables))))
+	printTableColumns(tables, value)
+	fmt.Println()
+}
+
+// printTableColumns prints the tables in ls-style column-major order sized
+// to the terminal width. Falls back to one-per-line when stdout isn't a TTY
+// or the width can't be determined.
+func printTableColumns(tables []string, colorize func(a ...any) string) {
+	const indent = 2
+	const gutter = 2
+	indentStr := strings.Repeat(" ", indent)
+
+	longest := 0
+	for _, t := range tables {
+		if len(t) > longest {
+			longest = len(t)
+		}
+	}
+
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || width-indent < longest {
+		for _, t := range tables {
+			fmt.Printf("%s%s\n", indentStr, colorize(t))
+		}
+		return
+	}
+
+	colWidth := longest + gutter
+	cols := max((width-indent+gutter)/colWidth, 1)
+	cols = min(cols, len(tables))
+	rows := (len(tables) + cols - 1) / cols
+
+	for r := range rows {
+		fmt.Print(indentStr)
+		// Count how many columns actually have an item in this row, so
+		// we can skip padding on the rightmost cell.
+		actualCols := 0
+		for c := range cols {
+			if c*rows+r < len(tables) {
+				actualCols++
+			}
+		}
+		for c := range actualCols {
+			name := tables[c*rows+r]
+			if c < actualCols-1 {
+				fmt.Print(colorize(fmt.Sprintf("%-*s", colWidth, name)))
+			} else {
+				fmt.Print(colorize(name))
+			}
+		}
+		fmt.Println()
+	}
+}
+
+// printSetupStatus writes a dim status line to stderr during the pre-TUI
+// setup phase so the user can see the "connecting / resolving tables" work
+// is actually progressing instead of looking like a silent hang.
+func printSetupStatus(msg string) {
+	prefix := color.New(color.FgHiBlack).Sprint("→")
+	fmt.Fprintf(os.Stderr, "%s %s\n", prefix, msg)
+}
+
 func ensureSemverPrefix(v string) string {
 	v = strings.TrimSpace(v)
 	if v == "" {
@@ -194,6 +290,16 @@ func main() {
 	// were given something that makes sense
 	root.ParseArgs(os.Args...)
 
+	if *showVersion {
+		_, current := moduleVersion()
+		if current == "" {
+			current = "unknown"
+		}
+		fmt.Println(current)
+		os.Exit(0)
+	}
+
+	printTitle()
 	maybeReportNewVersion()
 
 	if len(*args) < 2 {
@@ -205,7 +311,13 @@ func main() {
 		*noProgressBars = true
 	}
 
-	if *noProgressBars {
+	// The TUI is the primary rendering path. It's disabled when the user
+	// explicitly asks for plain output (-no-progress), when -verbose is set
+	// (every query would flood the log pane), or when stdout is not a TTY
+	// (piping / redirection). In the non-TUI path we also skip the COUNT(*)
+	// per table since there's no bar to feed it into.
+	useTUI := !*noProgressBars && !*verbose && term.IsTerminal(int(os.Stdout.Fd()))
+	if !useTUI {
 		*skipCount = true
 	}
 
@@ -214,7 +326,9 @@ func main() {
 	var guard = make(chan struct{}, *threads)
 
 	sourceDSN := (*args)[0]
+	sourceFriendly := sourceDSN
 	destDSNs := strings.Split((*args)[1], ",")
+	destFriendlyNames := make([]string, 0, len(destDSNs))
 
 	blue := color.New(color.FgBlue).SprintFunc()
 	red := color.New(color.FgRed).SprintFunc()
@@ -254,6 +368,7 @@ func main() {
 
 	// source connection is the first argument
 	// this is where our rows are coming from
+	printSetupStatus(fmt.Sprintf("connecting to source %q...", sourceFriendly))
 	src, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
 	if err != nil {
 		slog.Error("failed to create source connection", "error", err, "sourceDSN", sourceDSN)
@@ -293,6 +408,8 @@ func main() {
 
 		destIsPath := strings.HasPrefix(destDSN, "file:")
 		destIsClipboard := strings.EqualFold(destDSN, "clipboard")
+
+		printSetupStatus(fmt.Sprintf("opening destination %q...", friendlyName))
 
 		// resolve destination connection name
 		if connections != nil && !destIsPath && !destIsClipboard {
@@ -432,12 +549,10 @@ func main() {
 		}
 
 		dsts = append(dsts, destInfo{db, destIsPath, destIsClipboard, clipboardBuf})
+		destFriendlyNames = append(destFriendlyNames, friendlyName)
 	}
 
-	if len(dsts) > 1 {
-		slog.Info("importing to multiple destinations", "count", len(dsts))
-	}
-
+	printSetupStatus("resolving tables...")
 	tableNames, err := getTables(*aliasesFiles, *all, args, src)
 	if err != nil {
 		slog.Error("failed to get tables", "error", err, "aliasesFile", *aliasesFiles, "all", *all, "args", *args)
@@ -451,6 +566,7 @@ func main() {
 	// we collect into a slice so it can be reused across multiple destinations
 	var orderedTables []string
 	if len(*tableNames) > 0 {
+		printSetupStatus(fmt.Sprintf("ordering %d tables by size...", len(*tableNames)))
 		tablesCh := make(chan string, len(*tableNames))
 		go func() {
 			defer close(tablesCh)
@@ -472,12 +588,31 @@ func main() {
 		}
 	}
 
-	// our multi-progress bar ties right into our wait group
+	printRunHeader(sourceFriendly, destFriendlyNames, orderedTables)
+
 	var wg sync.WaitGroup
-	var p *mpb.Progress
-	if !*noProgressBars {
-		p = mpb.New(mpb.WithWaitGroup(&wg))
+
+	// In TUI mode, build the UI up front — every table registers as a row
+	// before any worker starts, so the first draw shows the full run. Route
+	// slog output through the UI's log writer (which tees to a temp file).
+	var u *ui
+	if useTUI {
+		var uiErr error
+		u, uiErr = newUI(sourceFriendly, destFriendlyNames, orderedTables)
+		if uiErr != nil {
+			slog.Error("failed to start TUI", "error", uiErr)
+			os.Exit(1)
+		}
+		defer u.Stop()
+		log.SetOutput(u.LogWriter())
+		go u.Run()
 	}
+
+	slog.Info("swoof run started",
+		"source", sourceFriendly,
+		"destinations", destFriendlyNames,
+		"tables", len(orderedTables),
+		"threads", *threads)
 
 	// we need to delay some funcs, most notably the foreign key constraint part.
 	// problem comes from us importing two tables that depend on each other; when
@@ -494,55 +629,20 @@ func main() {
 		// And IMO this is cleaner than having the func below accept the string
 		tableName := table
 
-		// ensure we only run up to our max imports at a time
-		guard <- struct{}{}
-
 		wg.Add(1)
 
-		var bar *mpb.Bar
-		if !*noProgressBars {
-			// Tracked locally so the rate closure can feed its value through
-			// formatShort; also means retry's bar.SetCurrent(0) keeps the
-			// displayed rate honest.
-			tableStart := time.Now()
-			var finalElapsed time.Duration
-			bar = p.New(0,
-				mpb.BarStyle(),
-				mpb.PrependDecorators(
-					decor.Name(color.HiBlueString(tableName)),
-					decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
-				),
-				mpb.AppendDecorators(
-					decor.Any(func(s decor.Statistics) string {
-						return "( " + color.HiCyanString(formatShort(s.Current)+"/"+formatShort(s.Total)) + ", "
-					}),
-					decor.Any(func(s decor.Statistics) string {
-						// Freeze the elapsed value on completion so the displayed
-						// rate stops drifting downward as the decorator keeps firing.
-						var elapsed time.Duration
-						if s.Completed {
-							if finalElapsed == 0 {
-								finalElapsed = time.Since(tableStart)
-							}
-							elapsed = finalElapsed
-						} else {
-							elapsed = time.Since(tableStart)
-						}
-						var rate int64
-						if elapsed > 0 {
-							rate = int64(float64(s.Current) / elapsed.Seconds())
-						}
-						return " " + color.HiGreenString(formatShort(rate)+"/s") + " ) "
-					}),
-					decor.AverageETA(decor.ET_STYLE_GO),
-					decor.Name(" | "),
-					decor.Elapsed(decor.ET_STYLE_GO, decor.WC{C: decor.DindentRight}),
-				),
-			)
+		var state *tableState
+		if u != nil {
+			state = u.State(tableName)
 		}
 
 		go func() {
 			defer wg.Done()
+
+			// Throttle after the bar is registered so progress rendering
+			// reflects all tables from the start; the semaphore just paces
+			// how many goroutines actually do work concurrently.
+			guard <- struct{}{}
 			defer func() { <-guard }()
 
 			// compute the per-table destination, applying WriterWithSubdir for file dests
@@ -555,6 +655,7 @@ func main() {
 			}
 
 			tempTableName := *tempTablePrefix + tableName
+			tableStart := time.Now()
 
 			// Safe to retry because the real table is only swapped in by the
 			// delayed finalization pass, which runs after the attempt succeeds.
@@ -563,10 +664,9 @@ func main() {
 					slog.Warn("retrying table import",
 						"tableName", tableName,
 						"attempt", attempt)
-					if bar != nil {
-						bar.SetCurrent(0)
-					}
+					state.Reset()
 				}
+				state.Begin(attempt)
 
 				// Fresh *sql.DB pool per attempt so NewFromDSN / Ping failures
 				// also go through the retry loop, and each table goroutine's
@@ -716,7 +816,7 @@ func main() {
 				g, ctx := errgroup.WithContext(context.Background())
 
 				var count int64
-				if !*skipData && !*noProgressBars && !*skipCount {
+				if !*skipData && !*skipCount {
 					countQ := "select count(*)`Count`from`" + tableName + "`"
 					if *whereClause != "" {
 						countQ += " where " + *whereClause + " "
@@ -724,7 +824,7 @@ func main() {
 					if err := srcTable.SelectContext(ctx, &count, countQ, 0); err != nil {
 						return struct{}{}, errors.Wrapf(err, "count rows for %q", tableName)
 					}
-					bar.SetTotal(count, false)
+					state.SetTotal(count)
 				}
 
 				// Build the finalization closure during the attempt but do NOT push it
@@ -758,7 +858,7 @@ func main() {
 					createSuffix := strings.TrimPrefix(tableInfo.CreateMySQL, "CREATE TABLE `"+tableName+"`")
 
 					for _, dst := range tableDsts {
-						if !*dryRyn {
+						if !*dryRun {
 							if err := dst.Exec("drop table if exists`" + tempTableName + "`"); err != nil {
 								return struct{}{}, errors.Wrapf(err, "drop temp table %q", tempTableName)
 							}
@@ -772,7 +872,7 @@ func main() {
 						// Queued to run after all tables finish importing. Renames the temp
 						// table over the real one, re-adds constraints, and copies triggers.
 						delayedFuncs <- func() {
-							if !*dryRyn {
+							if !*dryRun {
 								for _, dst := range tableDsts {
 									if err := dst.Exec("drop table if exists`" + tableName + "`"); err != nil {
 										slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
@@ -819,7 +919,7 @@ func main() {
 								// Strip DEFINER — the definer user may not exist on dest.
 								trigger.CreateMySQL = definerRegexp.ReplaceAllString(trigger.CreateMySQL, "")
 
-								if !*dryRyn {
+								if !*dryRun {
 									for _, dst := range tableDsts {
 										if err := dst.Exec(trigger.CreateMySQL); err != nil {
 											slog.Error("failed to execute trigger creation SQL", "error", err, "trigger", r.Trigger, "tableName", tableName)
@@ -832,11 +932,15 @@ func main() {
 					}
 				}
 
-				if *noProgressBars && attempt == 1 {
-					slog.Info("importing table", "tableName", tableName)
+				if attempt == 1 {
+					if count > 0 {
+						slog.Info("starting table", "tableName", tableName, "rows", count)
+					} else {
+						slog.Info("starting table", "tableName", tableName)
+					}
 				}
 
-				if !*skipData && !*dryRyn {
+				if !*skipData && !*dryRun {
 					insertPrefix := "insert into`" + tempTableName + "`"
 					if *insertIgnoreInto {
 						insertPrefix = "insert ignore into`" + tableName + "`"
@@ -865,9 +969,9 @@ func main() {
 						// Single destination: consume source channel directly.
 						g.Go(func() error {
 							inserter := tableDsts[0].I()
-							if !*noProgressBars {
+							if state != nil {
 								inserter = inserter.SetAfterRowExec(func(_ time.Time) {
-									bar.Increment()
+									state.Increment()
 								})
 							}
 							if err := inserter.InsertContext(ctx, insertPrefix, srcChRef.Interface()); err != nil {
@@ -928,9 +1032,9 @@ func main() {
 							g.Go(func() error {
 								inserter := tableDsts[j].I()
 								// Track progress from the first destination only.
-								if j == 0 && !*noProgressBars {
+								if j == 0 && state != nil {
 									inserter = inserter.SetAfterRowExec(func(_ time.Time) {
-										bar.Increment()
+										state.Increment()
 									})
 								}
 								if err := inserter.InsertContext(ctx, insertPrefix, dstChRefs[j].Interface()); err != nil {
@@ -978,12 +1082,15 @@ func main() {
 				if !isTransientError(err) {
 					return v, backoff.Permanent(err)
 				}
+				short := rootErrorMsg(err)
 				slog.Warn("transient table import error, will retry",
 					"tableName", tableName,
 					"attempt", attempts,
+					"cause", short,
 					"error", err,
 					"chain", formatErrorChain(err),
 					"stack", extractErrorStack(err))
+				state.Retrying(short)
 				return v, err
 			}
 
@@ -1006,20 +1113,88 @@ func main() {
 					"stack", extractErrorStack(inner),
 					"tableName", tableName,
 					"attempts", attempts)
+				state.Fail(rootErrorMsg(inner))
+				if u != nil {
+					u.Fatal(fmt.Errorf("table %q import failed after %d attempts: %w", tableName, attempts, inner))
+					return
+				}
 				os.Exit(1)
 			}
 
-			if !*noProgressBars {
-				// In case row count drifted between the count query and the stream.
-				bar.SetTotal(bar.Current(), true)
+			elapsed := time.Since(tableStart).Round(time.Second)
+			if attempts > 1 {
+				slog.Info("recovered after retries",
+					"tableName", tableName,
+					"attempts", attempts,
+					"duration", elapsed)
 			}
+			slog.Info("finished table",
+				"tableName", tableName,
+				"rows", state.Rows(),
+				"duration", elapsed)
+
+			state.Complete()
 		}()
 	}
 
-	if !*noProgressBars {
-		p.Wait()
-	} else {
+	workersDone := make(chan struct{})
+	go func() {
 		wg.Wait()
+		close(workersDone)
+	}()
+
+	if u != nil {
+		// If the TUI exits before workers finish, either the user interrupted
+		// (Ctrl+C / q -> errInterrupted) or a worker hit a permanent failure
+		// and called u.Fatal. We can't gracefully cancel the in-flight workers
+		// (no shared ctx), so force-exit either way; differentiate the message
+		// and exit code based on the recorded firstErr.
+		select {
+		case <-workersDone:
+		case <-u.Done():
+			log.SetOutput(os.Stderr)
+			fatalErr := u.FirstError()
+			path := u.LogPath()
+			if stderrors.Is(fatalErr, errInterrupted) {
+				fmt.Fprintln(os.Stderr, "\nswoof: interrupted")
+				if path != "" {
+					fmt.Fprintf(os.Stderr, "log: %s\n", path)
+				}
+				os.Exit(130)
+			}
+			if fatalErr != nil {
+				fmt.Fprintf(os.Stderr, "\nswoof: %v\n", fatalErr)
+			}
+			if path != "" {
+				fmt.Fprintf(os.Stderr, "full log: %s\n", path)
+			}
+			os.Exit(1)
+		}
+
+		// Normal completion: tear down the TUI before the finalization
+		// phase so those log lines (and any os.Exit paths they may hit)
+		// land on real stderr instead of being absorbed by a live tview
+		// screen.
+		fatalErr := u.FirstError()
+		if fatalErr == nil {
+			slog.Info("table imports complete",
+				"tables", tableCount,
+				"duration", time.Since(start).Round(time.Second))
+		}
+		u.Stop()
+		log.SetOutput(os.Stderr)
+		if fatalErr != nil {
+			fmt.Fprintf(os.Stderr, "\nswoof: %v\n", fatalErr)
+			if path := u.LogPath(); path != "" {
+				fmt.Fprintf(os.Stderr, "full log: %s\n", path)
+			}
+			os.Exit(1)
+		}
+		if path := u.LogPath(); path != "" {
+			fmt.Fprintf(os.Stderr, "log: %s\n", path)
+		}
+	} else {
+		<-workersDone
 	}
 
 	if !*insertIgnoreInto {
@@ -1068,7 +1243,7 @@ func main() {
 
 			funcInfo.CreateMySQL = definerRegexp.ReplaceAllString(funcInfo.CreateMySQL, "")
 
-			if !*dryRyn {
+			if !*dryRun {
 				for _, dst := range funcDsts {
 					err = dst.Exec("drop function if exists`" + f.FuncName + "`")
 					if err != nil {
@@ -1121,7 +1296,7 @@ func main() {
 
 			view.CreateMySQL = definerRegexp.ReplaceAllString(view.CreateMySQL, "")
 
-			if !*dryRyn {
+			if !*dryRun {
 				for _, dst := range viewDsts {
 					err = dst.Exec("drop view if exists`" + v.ViewName + "`")
 					if err != nil {
@@ -1174,7 +1349,7 @@ func main() {
 
 			procInfo.CreateMySQL = definerRegexp.ReplaceAllString(procInfo.CreateMySQL, "")
 
-			if !*dryRyn {
+			if !*dryRun {
 				for _, dst := range procDsts {
 					err = dst.Exec("drop procedure if exists`" + p.ProcName + "`")
 					if err != nil {
