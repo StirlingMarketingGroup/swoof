@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -263,10 +263,9 @@ func newUI(source string, dests []string, tableNames []string) (*ui, error) {
 		ContrastSecondaryTextColor:  tcell.ColorDefault,
 	}
 
-	logPath := filepath.Join(os.TempDir(), "swoof.log")
-	logFile, err := os.Create(logPath)
+	logFile, err := os.CreateTemp("", "swoof-*.log")
 	if err != nil {
-		return nil, fmt.Errorf("create log file %q: %w", logPath, err)
+		return nil, fmt.Errorf("create log file: %w", err)
 	}
 
 	u := &ui{
@@ -453,7 +452,7 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 	destStr := strings.Join(u.dests, ", ")
 	summaryPlain := fmt.Sprintf("Swoofing %d tables from %s to %s - Elapsed time: %s",
 		len(snaps), u.source, destStr, elapsed)
-	summaryPad := max((termW-len(summaryPlain))/2, 0)
+	summaryPad := max((termW-utf8.RuneCountInString(summaryPlain))/2, 0)
 	line1 := fmt.Sprintf("%s[gray]Swoofing [white::b]%d[-:-:-][gray] tables from [white::b]%s[-:-:-][gray] to [white::b]%s[-:-:-][gray] - Elapsed time: [white::b]%s[-:-:-]",
 		strings.Repeat(" ", summaryPad), len(snaps), u.source, destStr, elapsed)
 
@@ -651,13 +650,14 @@ func renderPct(s tableSnapshot) string {
 }
 
 func truncateRight(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
 	if n <= 1 {
-		return s[:n]
+		return string(r[:n])
 	}
-	return s[:n-1] + "…"
+	return string(r[:n-1]) + "…"
 }
 
 // truncateMiddle collapses the middle of an over-width string with "..." so
@@ -665,7 +665,8 @@ func truncateRight(s string, n int) string {
 // factorylaboratorytestingutilitycosts → factoryla...itycosts). Falls back to
 // right truncation when width is too small to fit the ellipsis.
 func truncateMiddle(s string, w int) string {
-	if len(s) <= w {
+	r := []rune(s)
+	if len(r) <= w {
 		return s
 	}
 	const ell = "..."
@@ -675,7 +676,7 @@ func truncateMiddle(s string, w int) string {
 	keep := w - len(ell)
 	front := (keep + 1) / 2
 	back := keep / 2
-	return s[:front] + ell + s[len(s)-back:]
+	return string(r[:front]) + ell + string(r[len(r)-back:])
 }
 
 func (u *ui) renderFooter() {
