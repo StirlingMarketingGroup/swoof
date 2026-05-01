@@ -34,7 +34,15 @@ const (
 	statusPending tableStatus = iota
 	statusRunning
 	statusRetrying
+	// statusDone marks a table whose worker has finished importing data into
+	// the temp table but whose post-run finalization (drop+rename of the real
+	// table, trigger copy) has not yet happened. Rendered blue.
 	statusDone
+	// statusFinalized is the terminal success state: the temp table has been
+	// renamed over the real one and triggers were copied. Rendered green.
+	// Tables in -insert-ignore mode skip directly to this state since there
+	// is no temp-table swap to wait on.
+	statusFinalized
 	statusFailed
 )
 
@@ -132,6 +140,17 @@ func (s *tableState) Complete() {
 	s.setStatus(statusDone)
 }
 
+// Finalize bumps the table from "imported" (statusDone) to "fully done"
+// (statusFinalized). Called by the delayed temp-table swap closure on
+// success, or directly by the worker in -insert-ignore mode where there
+// is no separate finalize step.
+func (s *tableState) Finalize() {
+	if s == nil {
+		return
+	}
+	s.setStatus(statusFinalized)
+}
+
 func (s *tableState) Fail(cause string) {
 	if s == nil {
 		return
@@ -221,24 +240,27 @@ func (w *logWriter) Write(p []byte) (int, error) {
 }
 
 type ui struct {
-	app       *tview.Application
-	flex      *tview.Flex
-	header    *tview.TextView
-	body      *tview.TextView
-	footer    *tview.TextView
-	states    []*tableState
-	byName    map[string]*tableState
-	logRing   *ringBuffer
-	logFile   *os.File
-	logWriter *logWriter
-	fatal     chan error
-	startedAt time.Time
-	stopOnce  sync.Once
-	stopped   atomic.Bool
-	firstErr  atomic.Pointer[error]
-	source    string
-	dests     []string
-	done      chan struct{}
+	app                    *tview.Application
+	flex                   *tview.Flex
+	header                 *tview.TextView
+	body                   *tview.TextView
+	footer                 *tview.TextView
+	states                 []*tableState
+	byName                 map[string]*tableState
+	logRing                *ringBuffer
+	logFile                *os.File
+	logWriter              *logWriter
+	fatal                  chan error
+	startedAt              time.Time
+	stopOnce               sync.Once
+	stopped                atomic.Bool
+	firstErr               atomic.Pointer[error]
+	source                 string
+	dests                  []string
+	done                   chan struct{}
+	completed              atomic.Bool
+	completedAt            atomic.Int64
+	postCompletionRendered atomic.Bool
 }
 
 // newUI constructs the TUI but does NOT start it. Call Run to drive the event
@@ -308,17 +330,19 @@ func newUI(source string, dests []string, tableNames []string) (*ui, error) {
 	u.app.SetRoot(u.flex, true).EnableMouse(false)
 
 	u.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
-		switch ev.Key() {
-		case tcell.KeyCtrlC:
-			u.Fatal(errInterrupted)
-			return nil
-		case tcell.KeyRune:
-			if ev.Rune() == 'q' || ev.Rune() == 'Q' {
-				u.Fatal(errInterrupted)
-				return nil
-			}
+		isExit := ev.Key() == tcell.KeyCtrlC ||
+			(ev.Key() == tcell.KeyRune && (ev.Rune() == 'q' || ev.Rune() == 'Q'))
+		if !isExit {
+			return ev
 		}
-		return ev
+		// In completion mode the run already finished — exit without
+		// recording an interruption error so main reports success.
+		if u.completed.Load() {
+			u.Stop()
+			return nil
+		}
+		u.Fatal(errInterrupted)
+		return nil
 	})
 
 	return u, nil
@@ -360,6 +384,25 @@ func (u *ui) FirstError() error {
 // Done returns a channel closed when the TUI event loop has finished.
 func (u *ui) Done() <-chan struct{} { return u.done }
 
+// MarkCompleted switches the UI into completion mode. The header swaps to a
+// "Swoofed!" banner with a "Press Q to exit" prompt and the elapsed time
+// freezes; the body and footer render once more (with their final content)
+// then stop being touched, so the user can scroll either pane without the
+// next render tick yanking their position. Q / Ctrl+C now stop cleanly
+// instead of recording errInterrupted.
+//
+// We deliberately don't QueueUpdateDraw an immediate render here — if the
+// user already pressed Q during finalization the event loop has stopped
+// and the queued send would block forever. The 100ms render tick picks
+// up the flags within one frame.
+func (u *ui) MarkCompleted() {
+	if u == nil {
+		return
+	}
+	u.completedAt.Store(time.Now().UnixNano())
+	u.completed.Store(true)
+}
+
 // Stop tears down the TUI and closes the log file. Idempotent and
 // goroutine-safe.
 func (u *ui) Stop() {
@@ -400,6 +443,12 @@ func (u *ui) Run() {
 }
 
 func (u *ui) render() {
+	// Once we've drawn the completion frame we leave the body and footer
+	// alone — calling SetText again would reset the user's scroll position.
+	if u.postCompletionRendered.Load() {
+		return
+	}
+
 	_, h, err := term.GetSize(int(os.Stdout.Fd()))
 	if err == nil {
 		footerH := min(10, max(3, h*3/10))
@@ -414,6 +463,17 @@ func (u *ui) render() {
 	u.renderHeader(snaps)
 	u.renderBody(snaps)
 	u.renderFooter()
+
+	if u.completed.Load() {
+		// Tint every pane's border green so the "done" state is obvious at
+		// a glance even before the user reads the banner. Done on the last
+		// frame only — postCompletionRendered short-circuits the next tick,
+		// so the border color sticks until exit.
+		u.header.SetBorderColor(tcell.ColorGreen)
+		u.body.SetBorderColor(tcell.ColorGreen)
+		u.footer.SetBorderColor(tcell.ColorGreen)
+		u.postCompletionRendered.Store(true)
+	}
 }
 
 func (u *ui) renderHeader(snaps []tableSnapshot) {
@@ -422,11 +482,13 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 		current = "dev"
 	}
 
-	var done, retrying, running, pending, failed int
+	var done, finalized, retrying, running, pending, failed int
 	for _, s := range snaps {
 		switch s.status {
 		case statusDone:
 			done++
+		case statusFinalized:
+			finalized++
 		case statusRetrying:
 			retrying++
 		case statusRunning:
@@ -438,7 +500,13 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 		}
 	}
 
-	elapsed := time.Since(u.startedAt).Round(time.Second)
+	// Freeze the elapsed time at completion so the banner shows the final
+	// run duration rather than ticking forever after the user is done.
+	elapsedEnd := time.Now()
+	if t := u.completedAt.Load(); t > 0 {
+		elapsedEnd = time.Unix(0, t)
+	}
+	elapsed := elapsedEnd.Sub(u.startedAt).Round(time.Second)
 
 	termW, _, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil || termW < 20 {
@@ -449,12 +517,23 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 	// is dim gray; values are bold white. Each value is wrapped as
 	// `[white::b]VALUE[-:-:-]` so the bold attr always resets cleanly, and
 	// `[gray]` re-applies gray for the next static run after each reset.
+	// In completion mode the static text turns green; the "Press Q to exit"
+	// prompt lives in the log pane (renderFooter) so it can't be missed.
 	destStr := strings.Join(u.dests, ", ")
-	summaryPlain := fmt.Sprintf("Swoofing %d tables from %s to %s - Elapsed time: %s",
-		len(snaps), u.source, destStr, elapsed)
-	summaryPad := max((termW-utf8.RuneCountInString(summaryPlain))/2, 0)
-	line1 := fmt.Sprintf("%s[gray]Swoofing [white::b]%d[-:-:-][gray] tables from [white::b]%s[-:-:-][gray] to [white::b]%s[-:-:-][gray] - Elapsed time: [white::b]%s[-:-:-]",
-		strings.Repeat(" ", summaryPad), len(snaps), u.source, destStr, elapsed)
+	var summaryPlain, line1 string
+	if u.completed.Load() {
+		summaryPlain = fmt.Sprintf("Swoofed %d tables from %s to %s in %s",
+			len(snaps), u.source, destStr, elapsed)
+		summaryPad := max((termW-utf8.RuneCountInString(summaryPlain))/2, 0)
+		line1 = fmt.Sprintf("%s[green::b]Swoofed [white::b]%d[-:-:-][green::b] tables from [white::b]%s[-:-:-][green::b] to [white::b]%s[-:-:-][green::b] in [white::b]%s[-:-:-]",
+			strings.Repeat(" ", summaryPad), len(snaps), u.source, destStr, elapsed)
+	} else {
+		summaryPlain = fmt.Sprintf("Swoofing %d tables from %s to %s - Elapsed time: %s",
+			len(snaps), u.source, destStr, elapsed)
+		summaryPad := max((termW-utf8.RuneCountInString(summaryPlain))/2, 0)
+		line1 = fmt.Sprintf("%s[gray]Swoofing [white::b]%d[-:-:-][gray] tables from [white::b]%s[-:-:-][gray] to [white::b]%s[-:-:-][gray] - Elapsed time: [white::b]%s[-:-:-]",
+			strings.Repeat(" ", summaryPad), len(snaps), u.source, destStr, elapsed)
+	}
 
 	// Line 2: four status counts evenly distributed across the width.
 	type statItem struct {
@@ -462,11 +541,14 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 		label string
 		color string
 	}
+	// Lifecycle order, left-to-right: each row moves through the buckets
+	// pending → running → retrying → imported → done as the run progresses.
 	stats := []statItem{
-		{done, "done", "green"},
-		{retrying, "retrying", "yellow"},
-		{running, "running", "aqua"},
 		{pending, "pending", "gray"},
+		{running, "running", "aqua"},
+		{retrying, "retrying", "yellow"},
+		{done, "imported", "blue"},
+		{finalized, "done", "green"},
 	}
 	if failed > 0 {
 		stats = append(stats, statItem{failed, "failed", "red"})
@@ -477,7 +559,7 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 		text := fmt.Sprintf("%d %s", it.count, it.label)
 		pad := max((per-len(text))/2, 0)
 		line2.WriteString(strings.Repeat(" ", pad))
-		line2.WriteString(fmt.Sprintf("[%s]%s[-]", it.color, text))
+		fmt.Fprintf(&line2, "[%s]%s[-]", it.color, text)
 		// Fill the rest of this segment (except the last) so everything stays aligned.
 		if i < len(stats)-1 {
 			line2.WriteString(strings.Repeat(" ", max(per-pad-len(text), 0)))
@@ -639,7 +721,7 @@ func statusAttrs(st tableStatus) string {
 }
 
 func renderPct(s tableSnapshot) string {
-	if s.status == statusDone {
+	if s.status == statusDone || s.status == statusFinalized {
 		return "100%"
 	}
 	if s.total <= 0 {
@@ -684,7 +766,27 @@ func (u *ui) renderFooter() {
 	for i, ln := range lines {
 		lines[i] = colorizeLogLine(ln)
 	}
-	u.footer.SetText(strings.Join(lines, "\n"))
+	text := strings.Join(lines, "\n")
+	if u.completed.Load() {
+		// Pin a bright "Press Q to exit" prompt to the bottom of the log
+		// pane on the final render so the user can't miss it. The blank
+		// line separates it from the last log entry; ScrollToEnd below
+		// keeps it visible by default while still letting the user scroll
+		// back through the log (the render loop has stopped touching the
+		// pane by this point).
+		const prompt = "Press Q to exit"
+		termW, _, err := term.GetSize(int(os.Stdout.Fd()))
+		if err != nil || termW < 20 {
+			termW = 120
+		}
+		// Footer has a border (2 cols) — usable width is termW-2.
+		pad := max((termW-2-len(prompt))/2, 0)
+		if text != "" {
+			text += "\n\n"
+		}
+		text += strings.Repeat(" ", pad) + "[yellow::b]" + prompt + "[-:-:-]"
+	}
+	u.footer.SetText(text)
 	u.footer.ScrollToEnd()
 }
 
@@ -743,6 +845,11 @@ func statusColor(s tableStatus) string {
 	case statusRetrying:
 		return "yellow"
 	case statusDone:
+		// Imported into the temp table but not yet swapped in. Blue makes
+		// the in-flight finalize phase pop against the green "fully done"
+		// rows below it.
+		return "blue"
+	case statusFinalized:
 		return "green"
 	case statusFailed:
 		return "red"
@@ -752,7 +859,9 @@ func statusColor(s tableStatus) string {
 
 // statusRank orders rows in the body so active work floats to the top and
 // finished tables sink to the bottom. Ties preserve the size-descending
-// order computed at startup.
+// order computed at startup. statusDone (imported, awaiting finalize) sits
+// just above statusFinalized so finalized rows accumulate at the bottom
+// of the "done" cluster as the swap pass progresses.
 func statusRank(s tableStatus) int {
 	switch s {
 	case statusRunning:
@@ -763,10 +872,12 @@ func statusRank(s tableStatus) int {
 		return 2
 	case statusDone:
 		return 3
-	case statusFailed:
+	case statusFinalized:
 		return 4
+	case statusFailed:
+		return 5
 	}
-	return 5
+	return 6
 }
 
 func statusRune(s tableStatus) string {
@@ -775,7 +886,7 @@ func statusRune(s tableStatus) string {
 		return "⟳"
 	case statusRetrying:
 		return "⏳"
-	case statusDone:
+	case statusDone, statusFinalized:
 		return "✓"
 	case statusFailed:
 		return "✗"
@@ -795,7 +906,7 @@ func renderBar(s tableSnapshot, width int) string {
 	switch {
 	case s.total <= 0:
 		filled = 0
-	case s.status == statusDone:
+	case s.status == statusDone, s.status == statusFinalized:
 		filled = inner
 	default:
 		cur := min(s.current, s.total)
@@ -861,6 +972,11 @@ func renderState(s tableSnapshot, now time.Time) string {
 	case statusPending:
 		return "pending"
 	case statusDone:
+		if s.startedAt > 0 && s.finishedAt > 0 {
+			return "imported " + time.Duration(s.finishedAt-s.startedAt).Round(time.Second).String()
+		}
+		return "imported"
+	case statusFinalized:
 		if s.startedAt > 0 && s.finishedAt > 0 {
 			return "done " + time.Duration(s.finishedAt-s.startedAt).Round(time.Second).String()
 		}

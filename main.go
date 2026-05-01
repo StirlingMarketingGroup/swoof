@@ -618,7 +618,11 @@ func main() {
 	// problem comes from us importing two tables that depend on each other; when
 	// one finishes before the other, if we create the constraints as well, then it will fail
 	// because the other table doesn't exist yet.
-	delayedFuncs := make(chan func(), len(orderedTables))
+	//
+	// Each delayed func returns an error so finalization can fail gracefully
+	// without an os.Exit — important now that the TUI stays alive through
+	// finalization and a hard exit would leave tview's alt-screen on top.
+	delayedFuncs := make(chan func() error, len(orderedTables))
 
 	tableCount := 0
 	for _, table := range orderedTables {
@@ -871,20 +875,18 @@ func main() {
 					onSuccess = func() {
 						// Queued to run after all tables finish importing. Renames the temp
 						// table over the real one, re-adds constraints, and copies triggers.
-						delayedFuncs <- func() {
+						delayedFuncs <- func() error {
 							if !*dryRun {
 								for _, dst := range tableDsts {
 									if err := dst.Exec("drop table if exists`" + tableName + "`"); err != nil {
-										slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
-										os.Exit(1)
+										return errors.Wrapf(err, "drop table %q", tempTableName)
 									}
 
 									// Non-atomic rename on purpose — atomic would also rename
 									// other tables' FK references to point at the old name.
 									// Small downtime on live dest is the accepted tradeoff.
 									if err := dst.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`"); err != nil {
-										slog.Error("failed to rename table", "error", err, "from", tempTableName, "to", tableName)
-										os.Exit(1)
+										return errors.Wrapf(err, "rename table %q to %q", tempTableName, tableName)
 									}
 
 									if len(constraints) != 0 {
@@ -900,11 +902,11 @@ func main() {
 							triggers := make(chan struct {
 								Trigger string
 							})
+							var triggerSelectErr error
 							go func() {
 								defer close(triggers)
 								if err := src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0); err != nil {
-									slog.Error("failed to select triggers", "error", err, "tableName", tableName)
-									os.Exit(1)
+									triggerSelectErr = err
 								}
 							}()
 							for r := range triggers {
@@ -912,8 +914,7 @@ func main() {
 									CreateMySQL string `mysql:"SQL Original Statement"`
 								}
 								if err := src.Select(&trigger, "show create trigger`"+r.Trigger+"`", 0); err != nil {
-									slog.Error("failed to select trigger creation syntax", "error", err, "trigger", r.Trigger, "tableName", tableName)
-									os.Exit(1)
+									return errors.Wrapf(err, "select trigger creation syntax for %q on table %q", r.Trigger, tableName)
 								}
 
 								// Strip DEFINER — the definer user may not exist on dest.
@@ -922,12 +923,19 @@ func main() {
 								if !*dryRun {
 									for _, dst := range tableDsts {
 										if err := dst.Exec(trigger.CreateMySQL); err != nil {
-											slog.Error("failed to execute trigger creation SQL", "error", err, "trigger", r.Trigger, "tableName", tableName)
-											os.Exit(1)
+											return errors.Wrapf(err, "execute trigger creation SQL for %q on table %q", r.Trigger, tableName)
 										}
 									}
 								}
 							}
+							if triggerSelectErr != nil {
+								return errors.Wrapf(triggerSelectErr, "select triggers for table %q", tableName)
+							}
+							// Bump the table's TUI state from "imported" (blue)
+							// to "done" (green) now that the temp table has been
+							// swapped in and triggers copied. Nil-safe in non-TUI mode.
+							state.Finalize()
+							return nil
 						}
 					}
 				}
@@ -1134,6 +1142,12 @@ func main() {
 				"duration", elapsed)
 
 			state.Complete()
+			// -insert-ignore writes straight to the real table; there is no
+			// delayed swap step to bump the row to "done" later, so finalize
+			// the TUI state immediately.
+			if *insertIgnoreInto {
+				state.Finalize()
+			}
 		}()
 	}
 
@@ -1171,216 +1185,232 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Normal completion: tear down the TUI before the finalization
-		// phase so those log lines (and any os.Exit paths they may hit)
-		// land on real stderr instead of being absorbed by a live tview
-		// screen.
-		fatalErr := u.FirstError()
-		if fatalErr == nil {
-			slog.Info("table imports complete",
-				"tables", tableCount,
-				"duration", time.Since(start).Round(time.Second))
-		}
-		u.Stop()
-		log.SetOutput(os.Stderr)
-		if fatalErr != nil {
+		if fatalErr := u.FirstError(); fatalErr != nil {
+			// A worker recorded fatal but workersDone won the race above.
+			// Tear down and exit on the worker's error instead of running
+			// finalization on a half-imported state.
+			u.Stop()
+			log.SetOutput(os.Stderr)
 			fmt.Fprintf(os.Stderr, "\nswoof: %v\n", fatalErr)
 			if path := u.LogPath(); path != "" {
 				fmt.Fprintf(os.Stderr, "full log: %s\n", path)
 			}
 			os.Exit(1)
 		}
-		if path := u.LogPath(); path != "" {
-			fmt.Fprintf(os.Stderr, "log: %s\n", path)
-		}
+
+		slog.Info("table imports complete",
+			"tables", tableCount,
+			"duration", time.Since(start).Round(time.Second))
 	} else {
 		<-workersDone
 	}
 
-	if !*insertIgnoreInto {
-		close(delayedFuncs)
+	// Finalization runs while the TUI is still alive (when present) so the
+	// user sees finalize logs in the footer pane and the table list as it
+	// stood when workers finished. Each step returns an error rather than
+	// calling os.Exit — a hard exit while tview owns the screen would leave
+	// the alt-screen on top with no visible error.
+	finalizeErr := func() error {
+		if !*insertIgnoreInto {
+			close(delayedFuncs)
 
-		slog.Info("finalizing table imports...")
+			slog.Info("finalizing table imports...")
 
-		for f := range delayedFuncs {
-			f()
-		}
-	}
-
-	// funcs, views, and procs are read from source once and applied to all dests
-	if *funcs {
-		slog.Info("importing functions...")
-
-		funcDsts := make([]*mysql.Database, len(dsts))
-		for i, d := range dsts {
-			funcDsts[i] = d.db
-			if d.isPath {
-				funcDsts[i] = d.db.WriterWithSubdir("funcs")
+			for f := range delayedFuncs {
+				if err := f(); err != nil {
+					return err
+				}
 			}
 		}
 
-		var funcs []struct {
-			FuncName string `mysql:"ROUTINE_NAME"`
-		}
-		err = src.Select(&funcs, "select`ROUTINE_NAME`"+
-			"from`information_schema`.`ROUTINES`"+
-			"where`ROUTINE_SCHEMA`=database()"+
-			"and`ROUTINE_TYPE`='FUNCTION'", 0)
-		if err != nil {
-			slog.Error("failed to select functions", "error", err)
-			os.Exit(1)
-		}
+		// funcs, views, and procs are read from source once and applied to all dests
+		if *funcs {
+			slog.Info("importing functions...")
 
-		for _, f := range funcs {
-			var funcInfo struct {
-				CreateMySQL string `mysql:"Create Function"`
-			}
-			err = src.Select(&funcInfo, "show create function`"+f.FuncName+"`", 0)
-			if err != nil {
-				slog.Error("failed to select function creation syntax", "error", err, "functionName", f.FuncName)
-				os.Exit(1)
+			funcDsts := make([]*mysql.Database, len(dsts))
+			for i, d := range dsts {
+				funcDsts[i] = d.db
+				if d.isPath {
+					funcDsts[i] = d.db.WriterWithSubdir("funcs")
+				}
 			}
 
-			funcInfo.CreateMySQL = definerRegexp.ReplaceAllString(funcInfo.CreateMySQL, "")
+			var srcFuncs []struct {
+				FuncName string `mysql:"ROUTINE_NAME"`
+			}
+			if err := src.Select(&srcFuncs, "select`ROUTINE_NAME`"+
+				"from`information_schema`.`ROUTINES`"+
+				"where`ROUTINE_SCHEMA`=database()"+
+				"and`ROUTINE_TYPE`='FUNCTION'", 0); err != nil {
+				return errors.Wrap(err, "select functions")
+			}
 
-			if !*dryRun {
-				for _, dst := range funcDsts {
-					err = dst.Exec("drop function if exists`" + f.FuncName + "`")
-					if err != nil {
-						slog.Error("failed to drop function", "error", err, "functionName", f.FuncName)
-						os.Exit(1)
-					}
+			for _, f := range srcFuncs {
+				var funcInfo struct {
+					CreateMySQL string `mysql:"Create Function"`
+				}
+				if err := src.Select(&funcInfo, "show create function`"+f.FuncName+"`", 0); err != nil {
+					return errors.Wrapf(err, "select function creation syntax for %q", f.FuncName)
+				}
 
-					err = dst.Exec(funcInfo.CreateMySQL)
-					if err != nil {
-						slog.Error("failed to execute function creation SQL", "error", err, "functionName", f.FuncName)
-						os.Exit(1)
+				funcInfo.CreateMySQL = definerRegexp.ReplaceAllString(funcInfo.CreateMySQL, "")
+
+				if !*dryRun {
+					for _, dst := range funcDsts {
+						if err := dst.Exec("drop function if exists`" + f.FuncName + "`"); err != nil {
+							return errors.Wrapf(err, "drop function %q", f.FuncName)
+						}
+						if err := dst.Exec(funcInfo.CreateMySQL); err != nil {
+							return errors.Wrapf(err, "create function %q", f.FuncName)
+						}
 					}
 				}
 			}
 		}
-	}
 
-	if *views {
-		slog.Info("importing views...")
+		if *views {
+			slog.Info("importing views...")
 
-		viewDsts := make([]*mysql.Database, len(dsts))
-		for i, d := range dsts {
-			viewDsts[i] = d.db
-			if d.isPath {
-				viewDsts[i] = d.db.WriterWithSubdir("views")
-			}
-		}
-
-		var views []struct {
-			ViewName string `mysql:"TABLE_NAME"`
-		}
-		err = src.Select(&views, "select`TABLE_NAME`"+
-			"from`information_schema`.`TABLES`"+
-			"where`TABLE_SCHEMA`=database()"+
-			"and`TABLE_TYPE`='VIEW'", 0)
-		if err != nil {
-			slog.Error("failed to select views", "error", err)
-			os.Exit(1)
-		}
-
-		for _, v := range views {
-			var view struct {
-				CreateMySQL string `mysql:"Create View"`
-			}
-			err = src.Select(&view, "show create view`"+v.ViewName+"`", 0)
-			if err != nil {
-				slog.Error("failed to select view creation syntax", "error", err, "viewName", v.ViewName)
-				os.Exit(1)
+			viewDsts := make([]*mysql.Database, len(dsts))
+			for i, d := range dsts {
+				viewDsts[i] = d.db
+				if d.isPath {
+					viewDsts[i] = d.db.WriterWithSubdir("views")
+				}
 			}
 
-			view.CreateMySQL = definerRegexp.ReplaceAllString(view.CreateMySQL, "")
+			var srcViews []struct {
+				ViewName string `mysql:"TABLE_NAME"`
+			}
+			if err := src.Select(&srcViews, "select`TABLE_NAME`"+
+				"from`information_schema`.`TABLES`"+
+				"where`TABLE_SCHEMA`=database()"+
+				"and`TABLE_TYPE`='VIEW'", 0); err != nil {
+				return errors.Wrap(err, "select views")
+			}
 
-			if !*dryRun {
-				for _, dst := range viewDsts {
-					err = dst.Exec("drop view if exists`" + v.ViewName + "`")
-					if err != nil {
-						slog.Error("failed to drop view", "error", err, "viewName", v.ViewName)
-						os.Exit(1)
-					}
+			for _, v := range srcViews {
+				var view struct {
+					CreateMySQL string `mysql:"Create View"`
+				}
+				if err := src.Select(&view, "show create view`"+v.ViewName+"`", 0); err != nil {
+					return errors.Wrapf(err, "select view creation syntax for %q", v.ViewName)
+				}
 
-					err = dst.Exec(view.CreateMySQL)
-					if err != nil {
-						slog.Error("failed to execute view creation SQL", "error", err, "viewName", v.ViewName)
-						os.Exit(1)
+				view.CreateMySQL = definerRegexp.ReplaceAllString(view.CreateMySQL, "")
+
+				if !*dryRun {
+					for _, dst := range viewDsts {
+						if err := dst.Exec("drop view if exists`" + v.ViewName + "`"); err != nil {
+							return errors.Wrapf(err, "drop view %q", v.ViewName)
+						}
+						if err := dst.Exec(view.CreateMySQL); err != nil {
+							return errors.Wrapf(err, "create view %q", v.ViewName)
+						}
 					}
 				}
 			}
 		}
-	}
 
-	if *procs {
-		slog.Info("importing stored procedures...")
+		if *procs {
+			slog.Info("importing stored procedures...")
 
-		procDsts := make([]*mysql.Database, len(dsts))
-		for i, d := range dsts {
-			procDsts[i] = d.db
-			if d.isPath {
-				procDsts[i] = d.db.WriterWithSubdir("procs")
-			}
-		}
-
-		var procs []struct {
-			ProcName string `mysql:"ROUTINE_NAME"`
-		}
-		err = src.Select(&procs, "select`ROUTINE_NAME`"+
-			"from`information_schema`.`ROUTINES`"+
-			"where`ROUTINE_SCHEMA`=database()"+
-			"and`ROUTINE_TYPE`='PROCEDURE'", 0)
-		if err != nil {
-			slog.Error("failed to select stored procedures", "error", err)
-			os.Exit(1)
-		}
-
-		for _, p := range procs {
-			var procInfo struct {
-				CreateMySQL string `mysql:"Create Procedure"`
-			}
-			err = src.Select(&procInfo, "show create procedure`"+p.ProcName+"`", 0)
-			if err != nil {
-				slog.Error("failed to select stored procedure creation syntax", "error", err, "procedureName", p.ProcName)
-				os.Exit(1)
+			procDsts := make([]*mysql.Database, len(dsts))
+			for i, d := range dsts {
+				procDsts[i] = d.db
+				if d.isPath {
+					procDsts[i] = d.db.WriterWithSubdir("procs")
+				}
 			}
 
-			procInfo.CreateMySQL = definerRegexp.ReplaceAllString(procInfo.CreateMySQL, "")
+			var srcProcs []struct {
+				ProcName string `mysql:"ROUTINE_NAME"`
+			}
+			if err := src.Select(&srcProcs, "select`ROUTINE_NAME`"+
+				"from`information_schema`.`ROUTINES`"+
+				"where`ROUTINE_SCHEMA`=database()"+
+				"and`ROUTINE_TYPE`='PROCEDURE'", 0); err != nil {
+				return errors.Wrap(err, "select stored procedures")
+			}
 
-			if !*dryRun {
-				for _, dst := range procDsts {
-					err = dst.Exec("drop procedure if exists`" + p.ProcName + "`")
-					if err != nil {
-						slog.Error("failed to drop procedure", "error", err, "procedureName", p.ProcName)
-						os.Exit(1)
-					}
+			for _, p := range srcProcs {
+				var procInfo struct {
+					CreateMySQL string `mysql:"Create Procedure"`
+				}
+				if err := src.Select(&procInfo, "show create procedure`"+p.ProcName+"`", 0); err != nil {
+					return errors.Wrapf(err, "select stored procedure creation syntax for %q", p.ProcName)
+				}
 
-					err = dst.Exec(procInfo.CreateMySQL)
-					if err != nil {
-						slog.Error("failed to execute stored procedure creation SQL", "error", err, "procedureName", p.ProcName)
-						os.Exit(1)
+				procInfo.CreateMySQL = definerRegexp.ReplaceAllString(procInfo.CreateMySQL, "")
+
+				if !*dryRun {
+					for _, dst := range procDsts {
+						if err := dst.Exec("drop procedure if exists`" + p.ProcName + "`"); err != nil {
+							return errors.Wrapf(err, "drop stored procedure %q", p.ProcName)
+						}
+						if err := dst.Exec(procInfo.CreateMySQL); err != nil {
+							return errors.Wrapf(err, "create stored procedure %q", p.ProcName)
+						}
 					}
 				}
 			}
 		}
+
+		for _, d := range dsts {
+			if d.isClipboard {
+				d.clipboard.WriteString("set foreign_key_checks=1;\n")
+
+				if err := clipboard.Init(); err != nil {
+					return errors.Wrap(err, "initialize clipboard")
+				}
+
+				clipboard.Write(clipboard.FmtText, d.clipboard.Bytes())
+
+				slog.Info("copied to clipboard", "size", len(d.clipboard.Bytes()))
+			}
+		}
+
+		return nil
+	}()
+
+	if finalizeErr != nil {
+		if u != nil {
+			u.Fatal(finalizeErr)
+			<-u.Done()
+			log.SetOutput(os.Stderr)
+			fmt.Fprintf(os.Stderr, "\nswoof: %v\n", finalizeErr)
+			if path := u.LogPath(); path != "" {
+				fmt.Fprintf(os.Stderr, "full log: %s\n", path)
+			}
+		} else {
+			slog.Error("finalization failed", "error", finalizeErr)
+		}
+		os.Exit(1)
 	}
 
-	for _, d := range dsts {
-		if d.isClipboard {
-			d.clipboard.WriteString("set foreign_key_checks=1;\n")
-
-			if err := clipboard.Init(); err != nil {
-				slog.Error("failed to initialize clipboard", "error", err)
-				os.Exit(1)
-			}
-
-			clipboard.Write(clipboard.FmtText, d.clipboard.Bytes())
-
-			slog.Info("copied to clipboard", "size", len(d.clipboard.Bytes()))
+	// User pressed Ctrl+C / q during finalization. We don't abort finalize
+	// itself (a partial drop/rename would leave dest in a worse state), but
+	// we honor the interrupt now instead of showing the "Swoofed!" banner.
+	if u != nil && stderrors.Is(u.FirstError(), errInterrupted) {
+		log.SetOutput(os.Stderr)
+		fmt.Fprintln(os.Stderr, "\nswoof: interrupted")
+		if path := u.LogPath(); path != "" {
+			fmt.Fprintf(os.Stderr, "log: %s\n", path)
 		}
+		os.Exit(130)
 	}
 
 	slog.Info("finished importing tables", "count", tableCount, "destinations", len(dsts), "duration", time.Since(start))
+
+	if u != nil {
+		// Hold the TUI open with a "Swoofed! Press Q to exit" banner so the
+		// user can scan the final per-table state and scroll the log pane
+		// before dismissing.
+		u.MarkCompleted()
+		<-u.Done()
+		log.SetOutput(os.Stderr)
+		if path := u.LogPath(); path != "" {
+			fmt.Fprintf(os.Stderr, "log: %s\n", path)
+		}
+	}
 }
