@@ -24,6 +24,7 @@ import (
 	mysql "github.com/StirlingMarketingGroup/cool-mysql"
 	"github.com/cenkalti/backoff/v5"
 	"github.com/fatih/color"
+	"github.com/gen2brain/beeep"
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/pkg/errors"
 	"github.com/posener/cmd"
@@ -176,15 +177,8 @@ func isNewerVersion(latest, current string) bool {
 	return semver.Compare(latestSemver, currentSemver) > 0
 }
 
-// printTitle prints the top-of-screen banner across three lines:
-//
-//	swoof v1.2.3
-//	Copyright © YYYY Stirling Marketing Group
-//	Licensed under MIT
-//
-// Emitted before anything else so it lands in the main terminal buffer
-// (not tview's alt-screen) and stays in the user's scrollback after the
-// TUI exits.
+// Called before the TUI starts so it stays in scrollback after tview's
+// alt-screen tears down.
 func printTitle() {
 	_, current := moduleVersion()
 	if current == "" {
@@ -208,10 +202,8 @@ func printRunHeader(source string, destinations []string, tables []string) {
 	fmt.Println()
 }
 
-// printRunSummaryLabels writes just the source / destination / tables-count
-// label block, without the per-table column list. The post-TUI summary calls
-// this after printTableColumns so the labels land below the names; non-TUI
-// mode wraps it via printRunHeader to preserve the original ordering.
+// Split from the table list so the post-TUI summary can place the labels
+// below the names (different ordering than non-TUI's printRunHeader).
 func printRunSummaryLabels(source string, destinations []string, tables []string) {
 	labelCyan := color.New(color.FgHiCyan).SprintFunc()
 	value := color.New(color.FgHiWhite).SprintFunc()
@@ -231,9 +223,6 @@ func printRunSummaryLabels(source string, destinations []string, tables []string
 	fmt.Printf("%s %s\n", labelCyan("tables:       "), value(fmt.Sprintf("%d total", len(tables))))
 }
 
-// printTableColumns prints the tables in ls-style column-major order sized
-// to the terminal width. Falls back to one-per-line when stdout isn't a TTY
-// or the width can't be determined. Names are tinted bright white.
 func printTableColumns(tables []string) {
 	const indent = 2
 	const gutter = 2
@@ -262,8 +251,6 @@ func printTableColumns(tables []string) {
 
 	for r := range rows {
 		fmt.Print(indentStr)
-		// Count how many columns actually have an item in this row, so
-		// we can skip padding on the rightmost cell.
 		actualCols := 0
 		for c := range cols {
 			if c*rows+r < len(tables) {
@@ -282,9 +269,12 @@ func printTableColumns(tables []string) {
 	}
 }
 
-// printSetupStatus writes a dim status line to stderr during the pre-TUI
-// setup phase so the user can see the "connecting / resolving tables" work
-// is actually progressing instead of looking like a silent hang.
+// Best-effort: silently no-ops where beeep can't reach a notification
+// service (SSH-to-headless, CI, etc.).
+func notifyDesktop(title, message string) {
+	_ = beeep.Notify(title, message, "")
+}
+
 func printSetupStatus(msg string) {
 	prefix := color.New(color.FgHiBlack).Sprint("→")
 	fmt.Fprintf(os.Stderr, "%s %s\n", prefix, msg)
@@ -354,21 +344,15 @@ func main() {
 		destFriendlyNames = append(destFriendlyNames, strings.TrimSpace(raw))
 	}
 
-	// Build the TUI before any connection work so that "connecting to source",
-	// "opening destination", "resolving tables", etc. land in the log pane
-	// instead of scrolling on the bare terminal. Tables register dynamically
-	// as the resolve query streams them back, so the body fills in
-	// size-descending order. setupStatuses keeps a copy of those messages so
-	// we can replay them on the user's terminal scrollback after the TUI
-	// exits — anything emitted while tview owns the screen is otherwise lost.
+	// TUI starts before connection work so progress lands in the log pane.
+	// setupStatuses captures messages for post-TUI scrollback replay —
+	// alt-screen output is otherwise lost on teardown.
 	var u *ui
 	var setupStatuses []string
 	if useTUI {
 		var uiErr error
 		u, uiErr = newUI(sourceFriendly, destFriendlyNames)
 		if uiErr != nil {
-			// Fail-to-build means there's no TUI to tear down, so plain
-			// slog + exit is fine here.
 			slog.Error("failed to start TUI", "error", uiErr)
 			os.Exit(1)
 		}
@@ -379,8 +363,6 @@ func main() {
 
 	setupStatus := func(msg string) {
 		if useTUI {
-			// Buffer for post-TUI replay; route through slog so the
-			// message also lands in the log pane during the run.
 			setupStatuses = append(setupStatuses, msg)
 			slog.Info(msg)
 		} else {
@@ -388,11 +370,8 @@ func main() {
 		}
 	}
 
-	// fatalSetup tears down the TUI before exiting so the error message
-	// lands on the user's terminal instead of being absorbed by tview's
-	// alt-screen. Use for any post-newUI setup-phase failure that ends in
-	// os.Exit(1); once workers have started, errors flow through u.Fatal
-	// (which already handles teardown).
+	// For post-newUI setup-phase os.Exits — tears down the TUI first so the
+	// error lands on the user's terminal. Worker-phase errors use u.Fatal.
 	fatalSetup := func(msg string, args ...any) {
 		if u != nil {
 			u.Stop()
@@ -644,16 +623,9 @@ func main() {
 		}
 	}
 
-	// Hand the full table list to the TUI in one shot. MySQL's ORDER BY in
-	// the resolve query waits for the full filesort before sending any
-	// rows, so a per-table dynamic registration would just flash all rows
-	// in within one render tick anyway — bulk-register and let the body
-	// flip from its "resolving" placeholder to the populated list.
 	u.SetTables(orderedTables)
 
-	// Non-TUI mode prints the source/dest/tables block + table list inline
-	// before the run starts. TUI mode skips this — the same information is
-	// replayed in scrollback after the user dismisses the TUI.
+	// TUI mode replays the run header post-dismiss; non-TUI prints it now.
 	if !useTUI {
 		printRunHeader(sourceFriendly, destFriendlyNames, orderedTables)
 	}
@@ -666,14 +638,7 @@ func main() {
 		"tables", len(orderedTables),
 		"threads", *threads)
 
-	// we need to delay some funcs, most notably the foreign key constraint part.
-	// problem comes from us importing two tables that depend on each other; when
-	// one finishes before the other, if we create the constraints as well, then it will fail
-	// because the other table doesn't exist yet.
-	//
-	// Each delayed func returns an error so finalization can fail gracefully
-	// without an os.Exit — important now that the TUI stays alive through
-	// finalization and a hard exit would leave tview's alt-screen on top.
+	// FK constraints applied post-import so cross-references resolve.
 	delayedFuncs := make(chan func() error, len(orderedTables))
 
 	tableCount := 0
@@ -984,9 +949,6 @@ func main() {
 							if triggerSelectErr != nil {
 								return errors.Wrapf(triggerSelectErr, "select triggers for table %q", tableName)
 							}
-							// Bump the table's TUI state from "imported" (blue)
-							// to "done" (green) now that the temp table has been
-							// swapped in and triggers copied. Nil-safe in non-TUI mode.
 							state.Finalize()
 							slog.Info("finalized table",
 								"tableName", tableName,
@@ -1198,9 +1160,7 @@ func main() {
 				"duration", elapsed)
 
 			state.Complete()
-			// -insert-ignore writes straight to the real table; there is no
-			// delayed swap step to bump the row to "done" later, so finalize
-			// the TUI state immediately.
+			// -insert-ignore has no delayed swap, so finalize TUI state now.
 			if *insertIgnoreInto {
 				state.Finalize()
 			}
@@ -1242,9 +1202,6 @@ func main() {
 		}
 
 		if fatalErr := u.FirstError(); fatalErr != nil {
-			// A worker recorded fatal but workersDone won the race above.
-			// Tear down and exit on the worker's error instead of running
-			// finalization on a half-imported state.
 			u.Stop()
 			log.SetOutput(os.Stderr)
 			fmt.Fprintf(os.Stderr, "\nswoof: %v\n", fatalErr)
@@ -1261,11 +1218,7 @@ func main() {
 		<-workersDone
 	}
 
-	// Finalization runs while the TUI is still alive (when present) so the
-	// user sees finalize logs in the footer pane and the table list as it
-	// stood when workers finished. Each step returns an error rather than
-	// calling os.Exit — a hard exit while tview owns the screen would leave
-	// the alt-screen on top with no visible error.
+	// Finalize keeps the TUI alive so swap progress shows in the log pane.
 	finalizeErr := func() error {
 		if !*insertIgnoreInto {
 			close(delayedFuncs)
@@ -1444,9 +1397,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// User pressed Ctrl+C / q during finalization. We don't abort finalize
-	// itself (a partial drop/rename would leave dest in a worse state), but
-	// we honor the interrupt now instead of showing the "Swoofed!" banner.
+	// Ctrl+C / q during finalize: skip the success banner. Can't abort
+	// finalize itself — partial swap would leave dest in a worse state.
 	if u != nil && stderrors.Is(u.FirstError(), errInterrupted) {
 		log.SetOutput(os.Stderr)
 		fmt.Fprintln(os.Stderr, "\nswoof: interrupted")
@@ -1458,20 +1410,15 @@ func main() {
 
 	slog.Info("finished importing tables", "count", tableCount, "destinations", len(dsts), "duration", time.Since(start))
 
+	notifyDesktop("swoof", fmt.Sprintf("Swoofed %d tables in %s",
+		tableCount, time.Since(start).Round(time.Second)))
+
 	if u != nil {
-		// Hold the TUI open with a "Swoofed! Press Q to exit" banner so the
-		// user can scan the final per-table state and scroll the log pane
-		// before dismissing.
 		u.MarkCompleted()
 		<-u.Done()
 		log.SetOutput(os.Stderr)
 
-		// Replay the setup phase + run summary into the user's terminal
-		// scrollback so they have a record of the run after tview's
-		// alt-screen has been torn down. Layout: blank line, the dim "→"
-		// status lines, blank line, the column-major table list, then the
-		// source/dest/tables labels (per the requested ordering), blank
-		// line, and finally the path to the full log file.
+		// Replay setup + run summary into scrollback now that alt-screen is gone.
 		fmt.Fprintln(os.Stderr)
 		for _, msg := range setupStatuses {
 			printSetupStatus(msg)

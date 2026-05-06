@@ -18,14 +18,10 @@ import (
 	"golang.org/x/term"
 )
 
-// Render tick interval. tview coalesces redraws at ~50ms so this lands well
-// under its ceiling without burning CPU.
+// Below tview's ~50ms redraw coalescing ceiling.
 const uiTickInterval = 100 * time.Millisecond
 
-// errInterrupted is the sentinel stored on `firstErr` when the user exits via
-// Ctrl+C or `q`. main checks for it to distinguish a user interrupt (exit
-// code 130, "interrupted" message) from a worker-driven Fatal (exit code 1
-// with the underlying error).
+// Distinguishes a user Ctrl+C / q (exit 130) from a worker Fatal (exit 1).
 var errInterrupted = errors.New("interrupted")
 
 type tableStatus int32
@@ -34,21 +30,12 @@ const (
 	statusPending tableStatus = iota
 	statusRunning
 	statusRetrying
-	// statusDone marks a table whose worker has finished importing data into
-	// the temp table but whose post-run finalization (drop+rename of the real
-	// table, trigger copy) has not yet happened. Rendered blue.
-	statusDone
-	// statusFinalized is the terminal success state: the temp table has been
-	// renamed over the real one and triggers were copied. Rendered green.
-	// Tables in -insert-ignore mode skip directly to this state since there
-	// is no temp-table swap to wait on.
-	statusFinalized
+	statusDone      // imported into temp table, awaiting swap. Blue.
+	statusFinalized // swap + triggers complete. Green. -insert-ignore lands here directly.
 	statusFailed
 )
 
-// tableState is the single source of truth for one table's render state. All
-// fields are atomically read/written so worker goroutines never need to hold a
-// lock or call into tview.
+// Atomic fields so workers never need a lock or a tview call.
 type tableState struct {
 	Name       string
 	Total      atomic.Int64
@@ -74,14 +61,9 @@ func (s *tableState) setCause(msg string) {
 	s.LastCause.Store(&msg)
 }
 
-// The methods below are all nil-receiver safe so the caller in main.go can
-// hold a *tableState that's nil in non-TUI mode and treat every call as a
-// no-op without inline guards.
+// All methods below are nil-receiver safe so non-TUI callers can ignore u.
 
-// Begin marks the table as running for `attempt`. StartedAt is reset every
-// time so the rate/ETA shown in the body reflects the current attempt rather
-// than time accumulated across earlier (failed) tries. Total wall-clock time
-// for the table is tracked separately by the caller via a local time.Now().
+// StartedAt resets every attempt so rate/ETA track the current try only.
 func (s *tableState) Begin(attempt int) {
 	if s == nil {
 		return
@@ -122,8 +104,6 @@ func (s *tableState) Reset() {
 	s.Current.Store(0)
 }
 
-// Rows returns the current row count for logging, nil-safe so non-TUI callers
-// can use it without branching.
 func (s *tableState) Rows() int64 {
 	if s == nil {
 		return 0
@@ -140,10 +120,7 @@ func (s *tableState) Complete() {
 	s.setStatus(statusDone)
 }
 
-// Finalize bumps the table from "imported" (statusDone) to "fully done"
-// (statusFinalized). Called by the delayed temp-table swap closure on
-// success, or directly by the worker in -insert-ignore mode where there
-// is no separate finalize step.
+// Called once the temp-table swap completes (or directly in -insert-ignore).
 func (s *tableState) Finalize() {
 	if s == nil {
 		return
@@ -188,8 +165,6 @@ func (s *tableState) snapshot() tableSnapshot {
 	}
 }
 
-// ringBuffer holds the tail of log output for the TUI footer. Mutex-guarded
-// because slog can emit from many goroutines simultaneously.
 type ringBuffer struct {
 	mu    sync.Mutex
 	lines []string
@@ -219,10 +194,7 @@ func (r *ringBuffer) snapshot() []string {
 	return out
 }
 
-// logWriter implements io.Writer. slog's default handler routes through the
-// log package, so `log.SetOutput(logWriter)` captures every slog.Info/Warn/Error
-// emitted during the run. One Write = one log line (log always emits whole
-// records), so we don't need to split on internal newlines.
+// One Write per log record (the log package emits whole records).
 type logWriter struct {
 	ring *ringBuffer
 	file io.Writer
@@ -239,12 +211,8 @@ func (w *logWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// scrollBarView is a TextView with a one-column vertical scrollbar painted
-// on the right edge. tview v0.42.0 has no built-in scrollbar for TextView,
-// so we embed and override Draw to delegate then overlay the bar. The
-// rendered content reserves the rightmost inner column (see renderBody and
-// renderFooter) so the bar never sits on top of text. Used for both the
-// table list and the log pane.
+// tview v0.42.0 has no built-in TextView scrollbar. Callers must reserve
+// the rightmost inner column so the bar doesn't sit on top of text.
 type scrollBarView struct {
 	*tview.TextView
 }
@@ -253,10 +221,6 @@ func newScrollBarView() *scrollBarView {
 	return &scrollBarView{TextView: tview.NewTextView()}
 }
 
-// Draw delegates to the embedded TextView, then paints a scrollbar in the
-// rightmost column of the inner rect when the content overflows the visible
-// height. Track is dim, thumb picks up the body's border color so it stays
-// in sync with the green completion tint.
 func (s *scrollBarView) Draw(screen tcell.Screen) {
 	s.TextView.Draw(screen)
 
@@ -265,8 +229,7 @@ func (s *scrollBarView) Draw(screen tcell.Screen) {
 		return
 	}
 
-	// Total displayed lines = number of '\n' + 1, since SetWrap(false) means
-	// each newline-separated chunk is exactly one screen row.
+	// SetWrap(false) means one '\n' = one row.
 	text := s.GetText(false)
 	total := strings.Count(text, "\n") + 1
 	if total <= h {
@@ -282,17 +245,13 @@ func (s *scrollBarView) Draw(screen tcell.Screen) {
 		offset = maxOffset
 	}
 
-	// Thumb height is proportional to visible/total; clamp to [1, h] so the
-	// bar is always visible and never larger than the track.
 	thumbH := min(max(h*h/total, 1), h)
-
 	thumbY := 0
 	if maxOffset > 0 && h > thumbH {
 		thumbY = offset * (h - thumbH) / maxOffset
 	}
 
-	// Match the thumb to the body's border color so the green completion
-	// tint flows through; track stays dim regardless.
+	// Thumb tracks BorderColor so the completion green tint flows through.
 	thumbColor := s.GetBorderColor()
 	trackStyle := tcell.StyleDefault.Foreground(tcell.ColorGray).Background(tcell.ColorDefault)
 	thumbStyle := tcell.StyleDefault.Foreground(thumbColor).Background(tcell.ColorDefault)
@@ -330,22 +289,13 @@ type ui struct {
 	completed   atomic.Bool
 	completedAt atomic.Int64
 
-	// statesMu guards states/byName. SetTables (called once after resolve)
-	// can race with the render tick reading the slice — Lock to write,
-	// RLock to read. Workers only call State after SetTables completes, so
-	// they don't contend.
+	// SetTables vs render-tick. Workers only read after SetTables completes.
 	statesMu sync.RWMutex
 }
 
-// newUI constructs the TUI but does NOT start it. Call Run to drive the event
-// loop. The body starts empty (with a "Resolving tables…" placeholder) and
-// SetTables is called once after the resolve query returns the full
-// size-descending list.
 func newUI(source string, dests []string) (*ui, error) {
-	// Inherit the terminal's own colors instead of tview's default
-	// black-bg/white-fg theme, so swoof blends with whatever color scheme
-	// the user has configured (light themes, transparent terminals, etc.).
-	// Explicit `[color]` tags in our output still override these per-text.
+	// Inherit terminal colors instead of tview's black-on-white default.
+	// Explicit `[color]` tags in our output still override per-text.
 	tview.Styles = tview.Theme{
 		PrimitiveBackgroundColor:    tcell.ColorDefault,
 		ContrastBackgroundColor:     tcell.ColorDefault,
@@ -399,10 +349,6 @@ func newUI(source string, dests []string) (*ui, error) {
 	u.app.SetRoot(u.flex, true).EnableMouse(false)
 
 	u.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
-		// Tab / Shift-Tab swap focus between the body (tables) and the
-		// footer (log). Each pane is independently scrollable; this is the
-		// only way the user can move into the log pane to scroll back
-		// through earlier entries.
 		if ev.Key() == tcell.KeyTab || ev.Key() == tcell.KeyBacktab {
 			if u.app.GetFocus() == u.footer {
 				u.app.SetFocus(u.body)
@@ -417,8 +363,7 @@ func newUI(source string, dests []string) (*ui, error) {
 		if !isExit {
 			return ev
 		}
-		// In completion mode the run already finished — exit without
-		// recording an interruption error so main reports success.
+		// Post-completion Q/Ctrl+C is a clean exit, not an interrupt.
 		if u.completed.Load() {
 			u.Stop()
 			return nil
@@ -432,11 +377,6 @@ func newUI(source string, dests []string) (*ui, error) {
 
 func (u *ui) LogWriter() io.Writer { return u.logWriter }
 
-// SetTables registers the run's table list in one shot, replacing any prior
-// list. Called once after the resolve query returns its full size-descending
-// result. Before this fires the body shows a "resolving" placeholder; after,
-// it renders one row per table. Safe to call concurrently with the render
-// loop.
 func (u *ui) SetTables(names []string) {
 	if u == nil {
 		return
@@ -461,7 +401,6 @@ func (u *ui) State(name string) *tableState {
 	return u.byName[name]
 }
 
-// LogPath returns the path of the temp log file written during the run.
 func (u *ui) LogPath() string {
 	if u.logFile == nil {
 		return ""
@@ -469,9 +408,6 @@ func (u *ui) LogPath() string {
 	return u.logFile.Name()
 }
 
-// Fatal records err as the run's first error (if none yet) and tears down
-// the TUI. Idempotent and goroutine-safe. Used both by worker-driven failures
-// and by the Ctrl+C / q input handler (which passes errInterrupted).
 func (u *ui) Fatal(err error) {
 	if err != nil {
 		u.firstErr.CompareAndSwap(nil, &err)
@@ -479,7 +415,6 @@ func (u *ui) Fatal(err error) {
 	u.Stop()
 }
 
-// FirstError returns the error passed to Fatal, if any, else nil.
 func (u *ui) FirstError() error {
 	if p := u.firstErr.Load(); p != nil {
 		return *p
@@ -487,21 +422,11 @@ func (u *ui) FirstError() error {
 	return nil
 }
 
-// Done returns a channel closed when the TUI event loop has finished.
 func (u *ui) Done() <-chan struct{} { return u.done }
 
-// MarkCompleted switches the UI into completion mode. The header swaps to a
-// green "Swoofed!" banner and the elapsed time freezes; the footer pins a
-// bold "Press Q to exit" line at the bottom; borders blink yellow→green for
-// a beat then settle on green. Re-renders keep firing every tick so terminal
-// resizes still reflow correctly, and TextView.SetText preserves scroll
-// position so the user can still page through either pane. Q / Ctrl+C now
-// stop cleanly instead of recording errInterrupted.
-//
-// We deliberately don't QueueUpdateDraw an immediate render here — if the
-// user already pressed Q during finalization the event loop has stopped
-// and the queued send would block forever. The 100ms render tick picks
-// up the flags within one frame.
+// No QueueUpdateDraw here — if the user already pressed Q during finalize,
+// the event loop is gone and the queued send would block forever. The
+// 100ms tick picks up the flags within one frame.
 func (u *ui) MarkCompleted() {
 	if u == nil {
 		return
@@ -510,8 +435,6 @@ func (u *ui) MarkCompleted() {
 	u.completed.Store(true)
 }
 
-// Stop tears down the TUI and closes the log file. Idempotent and
-// goroutine-safe.
 func (u *ui) Stop() {
 	u.stopOnce.Do(func() {
 		u.app.Stop()
@@ -522,8 +445,6 @@ func (u *ui) Stop() {
 	})
 }
 
-// Run starts the render tick goroutine and drives the tview event loop. Blocks
-// until Stop is called or tview exits.
 func (u *ui) Run() {
 	defer close(u.done)
 
@@ -550,9 +471,6 @@ func (u *ui) Run() {
 }
 
 func (u *ui) render() {
-	// Pane focus marker is updated every tick — even after the body/footer
-	// content has been frozen on completion, Tab cycling should still flip
-	// the ▸ from one title to the other.
 	focused := u.app.GetFocus()
 	bodyTitle := "  tables "
 	footerTitle := "  log "
@@ -582,10 +500,7 @@ func (u *ui) render() {
 	u.renderFooter()
 
 	if u.completed.Load() {
-		// Brief celebratory blink: yellow→green→yellow→green at blinkPhase
-		// each (4 phases total), then settle on green. After the blink
-		// SetBorderColor(green) keeps being called every tick — idempotent,
-		// so it just stays green for free.
+		// 4-phase yellow/green blink, then settle on green.
 		const blinkPhase = 125 * time.Millisecond
 		const blinkDuration = 4 * blinkPhase
 		var sinceCompleted time.Duration
@@ -593,7 +508,6 @@ func (u *ui) render() {
 			sinceCompleted = time.Since(time.Unix(0, t))
 		}
 		c := tcell.ColorGreen
-		// Phase 0 = yellow, 1 = green, 2 = yellow, 3 = green.
 		if sinceCompleted < blinkDuration && int(sinceCompleted/blinkPhase)%2 == 0 {
 			c = tcell.ColorYellow
 		}
@@ -603,12 +517,7 @@ func (u *ui) render() {
 	}
 }
 
-// centeredLine builds a horizontally-centered tview-tagged line by
-// alternating `staticColor`-tinted strings with bold-white values. parts
-// must be: string, value, string, value, ... (or any sequence; everything
-// is rendered with single-space separators). Strings render in
-// staticColor, every other type renders in [white::b]. Centering pad is
-// computed against the plain (tag-stripped) form.
+// Strings get staticColor, everything else gets [white::b].
 func centeredLine(termW int, staticColor string, parts ...any) string {
 	var plain, b strings.Builder
 	for i, p := range parts {
@@ -658,8 +567,7 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 		}
 	}
 
-	// Freeze the elapsed time at completion so the banner shows the final
-	// run duration rather than ticking forever after the user is done.
+	// Freeze elapsed at completion so the banner doesn't keep ticking.
 	elapsedEnd := time.Now()
 	if t := u.completedAt.Load(); t > 0 {
 		elapsedEnd = time.Unix(0, t)
@@ -671,12 +579,6 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 		termW = 120
 	}
 
-	// Line 1: centered semantic one-liner summarising the run. Static text
-	// gets `staticColor`; values are bold white. Each value is wrapped as
-	// `[white::b]VALUE[-:-:-]` so the bold attr always resets cleanly, and
-	// the static color is re-applied after each reset. In completion mode
-	// the static color turns green; the "Press Q to exit" prompt lives in
-	// the log pane (renderFooter) so it can't be missed.
 	destStr := strings.Join(u.dests, ", ")
 	var line1 string
 	switch {
@@ -684,9 +586,6 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 		line1 = centeredLine(termW, "green::b",
 			"Swoofed", len(snaps), "tables from", u.source, "to", destStr, "in", elapsed)
 	case len(snaps) == 0:
-		// Resolve phase hasn't registered any tables yet; placeholder line
-		// keeps the header centered and free of "Swoofing 0 tables" weirdness
-		// while connections are being opened.
 		line1 = centeredLine(termW, "gray",
 			"Connecting to", u.source, "and resolving tables - Elapsed time:", elapsed)
 	default:
@@ -694,14 +593,12 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 			"Swoofing", len(snaps), "tables from", u.source, "to", destStr, "- Elapsed time:", elapsed)
 	}
 
-	// Line 2: four status counts evenly distributed across the width.
 	type statItem struct {
 		count int
 		label string
 		color string
 	}
-	// Lifecycle order, left-to-right: each row moves through the buckets
-	// pending → running → retrying → imported → done as the run progresses.
+	// Left-to-right matches lifecycle order so a run's progress reads naturally.
 	stats := []statItem{
 		{pending, "pending", "gray"},
 		{running, "running", "aqua"},
@@ -719,7 +616,6 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 		pad := max((per-len(text))/2, 0)
 		line2.WriteString(strings.Repeat(" ", pad))
 		fmt.Fprintf(&line2, "[%s]%s[-]", it.color, text)
-		// Fill the rest of this segment (except the last) so everything stays aligned.
 		if i < len(stats)-1 {
 			line2.WriteString(strings.Repeat(" ", max(per-pad-len(text), 0)))
 		}
@@ -734,16 +630,10 @@ func (u *ui) renderBody(snaps []tableSnapshot) {
 		width = 120
 	}
 
-	// SetTables hasn't fired yet — show a centered "resolving" placeholder
-	// so the body isn't a blank box while connections open and the source
-	// runs its information_schema query. The render loop will flip back to
-	// the per-row list as soon as SetTables hands us the full list.
 	if len(snaps) == 0 && !u.completed.Load() {
 		const msg = "Resolving tables on "
 		const dotCadence = 125 * time.Millisecond
-		// Cycle the ellipsis between 1, 2, and 3 dots so the pane visibly
-		// *looks* like it's working. Trailing spaces keep the message
-		// width constant so the centering pad below doesn't jiggle.
+		// Trailing spaces keep total width constant so centering doesn't jiggle.
 		dotCount := int(time.Since(u.startedAt)/dotCadence)%3 + 1
 		tail := strings.Repeat(".", dotCount) + strings.Repeat(" ", 3-dotCount)
 		plainLen := len(msg) + len(u.source) + 3
@@ -753,16 +643,10 @@ func (u *ui) renderBody(snaps []tableSnapshot) {
 		return
 	}
 
-	// Body has a border; tview draws left/right border columns, so every row
-	// has two fewer usable columns than the raw terminal. We reserve one more
-	// column on the right for the scrollbar painted by scrollBarView.Draw,
-	// so the bar never sits on top of row text.
+	// 2 cols of border + 1 reserved for the scrollbar overlay.
 	width -= 3
 
-	// Fixed caps for the two variable-width columns so widths don't bounce
-	// around as tables finish or retry. Names longer than the cap are
-	// middle-truncated (factorylab...itycosts); states longer are
-	// right-truncated with a trailing ellipsis.
+	// Fixed caps so column widths don't jiggle as states change.
 	const (
 		maxNameW    = 28
 		fixedStateW = 12
@@ -780,14 +664,11 @@ func (u *ui) renderBody(snaps []tableSnapshot) {
 
 	now := time.Now()
 
-	// Reorder for display: running > retrying > pending > done > failed.
-	// Stable so tables within each bucket keep their data-size order.
+	// Active rows float up; stable sort preserves size-descending within a bucket.
 	sort.SliceStable(snaps, func(i, j int) bool {
 		return statusRank(snaps[i].status) < statusRank(snaps[j].status)
 	})
 
-	// Each table occupies two lines in narrow mode, so separate blocks with
-	// a blank line; single-line wide mode just needs one newline.
 	separator := "\n"
 	if width < narrowWidth {
 		separator = "\n\n"
@@ -803,9 +684,7 @@ func (u *ui) renderBody(snaps []tableSnapshot) {
 	u.body.SetText(b.String())
 }
 
-// narrowWidth is the threshold below which we split each table into a
-// two-line block so the bar still has room to breathe. Measured after the
-// body's border has been subtracted.
+// Below this many usable cols, rows go 2-line so the bar has room.
 const narrowWidth = 100
 
 const (
@@ -814,8 +693,6 @@ const (
 	rateW   = 7
 )
 
-// renderRow picks between the wide single-line layout and the narrow two-line
-// layout based on the available body width.
 func renderRow(s tableSnapshot, nameW, stateW, termW int, now time.Time) string {
 	if termW < narrowWidth {
 		return renderRowNarrow(s, nameW, termW, now)
@@ -823,7 +700,6 @@ func renderRow(s tableSnapshot, nameW, stateW, termW int, now time.Time) string 
 	return renderRowWide(s, nameW, stateW, termW, now)
 }
 
-// renderRowWide is the single-line layout: glyph name pct [bar] counts rate state.
 func renderRowWide(s tableSnapshot, nameW, stateW, termW int, now time.Time) string {
 	attrs := statusAttrs(s.status)
 
@@ -840,8 +716,7 @@ func renderRowWide(s tableSnapshot, nameW, stateW, termW int, now time.Time) str
 	rateP := fmt.Sprintf("%*s", rateW, truncateRight(rate, rateW))
 	stateP := fmt.Sprintf("[%s]%-*s[-:-:-]", attrs, stateW, truncateRight(state, stateW))
 
-	// Width budget: 1 glyph + 1 sp + nameW + 1 sp + pctW + 1 sp
-	//             + [bar] + 2 sp + countsW + 2 sp + rateW + 2 sp + stateW.
+	// 1 glyph + 1sp + nameW + 1sp + pctW + 1sp + [bar] + 2sp + countsW + 2sp + rateW + 2sp + stateW.
 	barW := max(termW-(1+1+nameW+1+pctW+1+2+countsW+2+rateW+2+stateW), 10)
 	bar := renderBar(s, barW)
 
@@ -849,11 +724,6 @@ func renderRowWide(s tableSnapshot, nameW, stateW, termW int, now time.Time) str
 		glyph, namePadded, pct, bar, countsP, rateP, stateP)
 }
 
-// renderRowNarrow is the two-line layout used when the body is under
-// narrowWidth cols. Line 1 is glyph/name/pct/bar; line 2 keeps counts and
-// rate flush left and aligns state under the bar column (or, for short
-// names where that would overlap the rate column, with at least a 2-space
-// gap after rate).
 func renderRowNarrow(s tableSnapshot, nameW, termW int, now time.Time) string {
 	attrs := statusAttrs(s.status)
 
@@ -862,16 +732,12 @@ func renderRowNarrow(s tableSnapshot, nameW, termW int, now time.Time) string {
 	namePadded := fmt.Sprintf("[%s]%-*s[-:-:-]", attrs, nameW, name)
 	pct := renderPct(s)
 
-	// Column at which the bar starts on line 1. Line 2's state uses the
-	// same column so the eye can track the row.
 	indentW := 1 + 1 + nameW + 1 + pctW + 1
 
-	// Line 1: glyph + name + pct + [bar fills remaining]
 	barW := max(termW-indentW, 10)
 	bar := renderBar(s, barW)
 	line1 := fmt.Sprintf("%s %s %s %s", glyph, namePadded, pct, bar)
 
-	// Line 2: counts  rate  <pad to bar column>  state
 	counts := renderCounts(s)
 	rate := renderRate(s, now)
 	state := renderState(s, now)
@@ -879,10 +745,8 @@ func renderRowNarrow(s tableSnapshot, nameW, termW int, now time.Time) string {
 	countsP := fmt.Sprintf("%-*s", countsW, truncateRight(counts, countsW))
 	rateP := fmt.Sprintf("%-*s", rateW, truncateRight(rate, rateW))
 
-	// Indent line 2 by 2 so counts/rate line up with the table name on line 1.
 	const leadIndent = 2
-	// Push state out to the bar column, with a minimum 2-space gap so short
-	// names don't collide with the rate column.
+	// 2-space minimum after rate, otherwise short names let state overlap.
 	pad := max(indentW-(leadIndent+countsW+2+rateW), 2)
 	stateW := max(termW-(leadIndent+countsW+2+rateW+pad), 0)
 	stateP := fmt.Sprintf("[%s]%s[-:-:-]", attrs, truncateRight(state, stateW))
@@ -891,8 +755,6 @@ func renderRowNarrow(s tableSnapshot, nameW, termW int, now time.Time) string {
 	return line1 + "\n" + line2
 }
 
-// statusAttrs returns the tview attr string (`color` or `color::b`) so running
-// and retrying rows stand out in bold.
 func statusAttrs(st tableStatus) string {
 	c := statusColor(st)
 	if st == statusRunning || st == statusRetrying {
@@ -923,10 +785,6 @@ func truncateRight(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// truncateMiddle collapses the middle of an over-width string with "..." so
-// the beginning and end both survive (helpful for MySQL table names like
-// factorylaboratorytestingutilitycosts → factoryla...itycosts). Falls back to
-// right truncation when width is too small to fit the ellipsis.
 func truncateMiddle(s string, w int) string {
 	r := []rune(s)
 	if len(r) <= w {
@@ -949,20 +807,12 @@ func (u *ui) renderFooter() {
 	}
 	text := strings.Join(lines, "\n")
 	if u.completed.Load() {
-		// Pin a bright "Press Q to exit" prompt to the bottom of the log
-		// pane on the final render so the user can't miss it. The blank
-		// line separates it from the last log entry; ScrollToEnd below
-		// keeps it visible by default while still letting the user scroll
-		// back through the log (the render loop has stopped touching the
-		// pane by this point).
 		const prompt = "Press Q to exit"
 		termW, _, err := term.GetSize(int(os.Stdout.Fd()))
 		if err != nil || termW < 20 {
 			termW = 120
 		}
-		// Footer has a border (2 cols) and reserves one more column on the
-		// right for the scrollbar painted by scrollBarView.Draw, so the
-		// usable width for centering is termW-3.
+		// 2 cols border + 1 reserved for scrollbar = -3 of usable width.
 		pad := max((termW-3-len(prompt))/2, 0)
 		if text != "" {
 			text += "\n\n"
@@ -970,16 +820,12 @@ func (u *ui) renderFooter() {
 		text += strings.Repeat(" ", pad) + "[yellow::b]" + prompt + "[-:-:-]"
 	}
 	u.footer.SetText(text)
-	// Auto-scroll only when the user isn't focused on the log pane —
-	// otherwise the next tick would yank their cursor back to the latest
-	// entry whenever a new line streams in.
+	// Skip auto-scroll when focused so user scroll isn't yanked back.
 	if u.app.GetFocus() != u.footer {
 		u.footer.ScrollToEnd()
 	}
 }
 
-// logLevels maps the text levels emitted by slog's default handler to tview
-// color tags; unknown levels fall through to plain text.
 var logLevels = map[string]string{
 	"DEBUG": "gray",
 	"INFO":  "aqua",
@@ -987,16 +833,11 @@ var logLevels = map[string]string{
 	"ERROR": "red",
 }
 
-// logKeyPattern matches `<space-or-start>key=` so the key part of a key=value
-// slog attribute can be dimmed. Values are left as-is — they may be quoted
-// and contain arbitrary content, so we don't try to parse them.
+// Matches `key=` so we can dim keys without parsing the arbitrary values.
 var logKeyPattern = regexp.MustCompile(`(^|\s)([A-Za-z_][A-Za-z0-9_.-]*)=`)
 
-// logMessageColors maps known slog message texts (the literal first arg to
-// slog.Info/Warn/Error) to a tview color name applied to the message in the
-// log pane. Mirrors the per-row colors used in the body so the lifecycle of
-// a table — running (aqua) → imported (blue) → done (green) — reads the same
-// way in both panes. Messages not in this map keep the default text color.
+// Mirrors the body's per-row palette so the table lifecycle reads the
+// same way in both panes. Unmatched messages render plain.
 var logMessageColors = map[string]string{
 	"starting table":              "aqua",
 	"finished table":              "blue",
@@ -1007,14 +848,10 @@ var logMessageColors = map[string]string{
 	"finished importing tables":   "green",
 }
 
-// colorizeLogLine applies inline tview color tags to a raw slog line of the
-// form `YYYY/MM/DD HH:MM:SS LEVEL msg key=value…`. Timestamp is dim, level
-// is colored by severity, the message is colored when it matches an entry
-// in logMessageColors, and attribute keys are dim. All raw text is escaped
-// against tview's tag parser so bracket chars in SQL errors can't trigger
-// color tags.
+// All raw text is tview.Escape'd so brackets in SQL errors don't trip the
+// color-tag parser.
 func colorizeLogLine(raw string) string {
-	// Minimum prefix is "YYYY/MM/DD HH:MM:SS LEVEL " = 25 chars.
+	// Min prefix "YYYY/MM/DD HH:MM:SS LEVEL " = 25 chars.
 	if len(raw) < 25 || raw[4] != '/' || raw[7] != '/' || raw[10] != ' ' ||
 		raw[13] != ':' || raw[16] != ':' || raw[19] != ' ' {
 		return tview.Escape(raw)
@@ -1035,9 +872,6 @@ func colorizeLogLine(raw string) string {
 		return tview.Escape(raw)
 	}
 
-	// Split tail into the free-text message and the trailing key=value
-	// attributes. The message ends just before the first " key=" match;
-	// slog.Info("foo bar", ...) yields msg="foo bar" with attrs after it.
 	msg, attrs := tail, ""
 	if loc := logKeyPattern.FindStringIndex(tail); loc != nil {
 		msg = strings.TrimRight(tail[:loc[0]], " ")
@@ -1062,9 +896,6 @@ func statusColor(s tableStatus) string {
 	case statusRetrying:
 		return "yellow"
 	case statusDone:
-		// Imported into the temp table but not yet swapped in. Blue makes
-		// the in-flight finalize phase pop against the green "fully done"
-		// rows below it.
 		return "blue"
 	case statusFinalized:
 		return "green"
@@ -1074,11 +905,6 @@ func statusColor(s tableStatus) string {
 	return "gray"
 }
 
-// statusRank orders rows in the body so active work floats to the top and
-// finished tables sink to the bottom. Ties preserve the size-descending
-// order computed at startup. statusDone (imported, awaiting finalize) sits
-// just above statusFinalized so finalized rows accumulate at the bottom
-// of the "done" cluster as the swap pass progresses.
 func statusRank(s tableStatus) int {
 	switch s {
 	case statusRunning:
@@ -1100,15 +926,9 @@ func statusRank(s tableStatus) int {
 func statusRune(s tableStatus) string {
 	switch s {
 	case statusRunning:
-		// Black right-pointing triangle (U+25B6) — "playing/active". Distinct
-		// from the retrying arrow so the two states are easy to tell apart at
-		// a glance.
 		return "▶"
 	case statusRetrying:
-		// Clockwise open-circle arrow (U+21BB) — single-width on every
-		// terminal. Replaces the hourglass U+23F3, which renders
-		// double-width on macOS Terminal/iTerm2 and pushed the row layout
-		// out of alignment.
+		// U+21BB; the hourglass U+23F3 renders double-width on macOS.
 		return "↻"
 	case statusDone, statusFinalized:
 		return "✓"
@@ -1118,9 +938,6 @@ func statusRune(s tableStatus) string {
 	return "·"
 }
 
-// renderBar draws an mpb-style bracketed bar like `[=====>----------]`. Width
-// is the total visible width including the brackets. Output uses tview color
-// tags and `[[` to escape the literal opening bracket.
 func renderBar(s tableSnapshot, width int) string {
 	if width < 3 {
 		return strings.Repeat("-", width)
@@ -1158,8 +975,6 @@ func renderBar(s tableSnapshot, width int) string {
 		inside += fmt.Sprintf("[gray]%s[-]", dashRun)
 	}
 
-	// tview only treats `[...]` as a tag when the contents form a valid one;
-	// a standalone `[` or `]` renders literally, so we just wrap `inside`.
 	return "[" + inside + "]"
 }
 
