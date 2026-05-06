@@ -176,9 +176,15 @@ func isNewerVersion(latest, current string) bool {
 	return semver.Compare(latestSemver, currentSemver) > 0
 }
 
-// printTitle prints the top-of-screen banner: `swoof vX.Y.Z - Copyright…`.
-// Emitted before the update-available warning and the "connecting to source"
-// setup lines so the user sees exactly what's running before anything else.
+// printTitle prints the top-of-screen banner across three lines:
+//
+//	swoof v1.2.3
+//	Copyright © YYYY Stirling Marketing Group
+//	Licensed under MIT
+//
+// Emitted before anything else so it lands in the main terminal buffer
+// (not tview's alt-screen) and stays in the user's scrollback after the
+// TUI exits.
 func printTitle() {
 	_, current := moduleVersion()
 	if current == "" {
@@ -186,11 +192,27 @@ func printTitle() {
 	}
 	labelGreen := color.New(color.FgHiGreen).Add(color.Bold).SprintFunc()
 	value := color.New(color.FgHiWhite).SprintFunc()
-	copyrightWithYear := fmt.Sprintf("Copyright © %d Stirling Marketing Group", time.Now().Year())
-	fmt.Printf("%s %s - %s\n\n", labelGreen("swoof"), value(current), value(copyrightWithYear))
+	dim := color.New(color.FgHiBlack).SprintFunc()
+	fmt.Printf("%s %s\n", labelGreen("swoof"), value(current))
+	fmt.Printf("%s\n", dim(fmt.Sprintf("Copyright © %d Stirling Marketing Group", time.Now().Year())))
+	fmt.Printf("%s\n", dim("Licensed under MIT"))
 }
 
 func printRunHeader(source string, destinations []string, tables []string) {
+	printRunSummaryLabels(source, destinations, tables)
+	if len(tables) == 0 {
+		return
+	}
+	fmt.Println()
+	printTableColumns(tables)
+	fmt.Println()
+}
+
+// printRunSummaryLabels writes just the source / destination / tables-count
+// label block, without the per-table column list. The post-TUI summary calls
+// this after printTableColumns so the labels land below the names; non-TUI
+// mode wraps it via printRunHeader to preserve the original ordering.
+func printRunSummaryLabels(source string, destinations []string, tables []string) {
 	labelCyan := color.New(color.FgHiCyan).SprintFunc()
 	value := color.New(color.FgHiWhite).SprintFunc()
 
@@ -206,18 +228,17 @@ func printRunHeader(source string, destinations []string, tables []string) {
 		fmt.Printf("%s %s\n", labelCyan("tables:       "), value("none"))
 		return
 	}
-	fmt.Printf("%s %s\n\n", labelCyan("tables:       "), value(fmt.Sprintf("%d total", len(tables))))
-	printTableColumns(tables, value)
-	fmt.Println()
+	fmt.Printf("%s %s\n", labelCyan("tables:       "), value(fmt.Sprintf("%d total", len(tables))))
 }
 
 // printTableColumns prints the tables in ls-style column-major order sized
 // to the terminal width. Falls back to one-per-line when stdout isn't a TTY
-// or the width can't be determined.
-func printTableColumns(tables []string, colorize func(a ...any) string) {
+// or the width can't be determined. Names are tinted bright white.
+func printTableColumns(tables []string) {
 	const indent = 2
 	const gutter = 2
 	indentStr := strings.Repeat(" ", indent)
+	colorize := color.New(color.FgHiWhite).SprintFunc()
 
 	longest := 0
 	for _, t := range tables {
@@ -329,6 +350,57 @@ func main() {
 	sourceFriendly := sourceDSN
 	destDSNs := strings.Split((*args)[1], ",")
 	destFriendlyNames := make([]string, 0, len(destDSNs))
+	for _, raw := range destDSNs {
+		destFriendlyNames = append(destFriendlyNames, strings.TrimSpace(raw))
+	}
+
+	// Build the TUI before any connection work so that "connecting to source",
+	// "opening destination", "resolving tables", etc. land in the log pane
+	// instead of scrolling on the bare terminal. Tables register dynamically
+	// as the resolve query streams them back, so the body fills in
+	// size-descending order. setupStatuses keeps a copy of those messages so
+	// we can replay them on the user's terminal scrollback after the TUI
+	// exits — anything emitted while tview owns the screen is otherwise lost.
+	var u *ui
+	var setupStatuses []string
+	if useTUI {
+		var uiErr error
+		u, uiErr = newUI(sourceFriendly, destFriendlyNames)
+		if uiErr != nil {
+			// Fail-to-build means there's no TUI to tear down, so plain
+			// slog + exit is fine here.
+			slog.Error("failed to start TUI", "error", uiErr)
+			os.Exit(1)
+		}
+		defer u.Stop()
+		log.SetOutput(u.LogWriter())
+		go u.Run()
+	}
+
+	setupStatus := func(msg string) {
+		if useTUI {
+			// Buffer for post-TUI replay; route through slog so the
+			// message also lands in the log pane during the run.
+			setupStatuses = append(setupStatuses, msg)
+			slog.Info(msg)
+		} else {
+			printSetupStatus(msg)
+		}
+	}
+
+	// fatalSetup tears down the TUI before exiting so the error message
+	// lands on the user's terminal instead of being absorbed by tview's
+	// alt-screen. Use for any post-newUI setup-phase failure that ends in
+	// os.Exit(1); once workers have started, errors flow through u.Fatal
+	// (which already handles teardown).
+	fatalSetup := func(msg string, args ...any) {
+		if u != nil {
+			u.Stop()
+		}
+		log.SetOutput(os.Stderr)
+		slog.Error(msg, args...)
+		os.Exit(1)
+	}
 
 	blue := color.New(color.FgBlue).SprintFunc()
 	red := color.New(color.FgRed).SprintFunc()
@@ -341,8 +413,7 @@ func main() {
 	if connections != nil {
 		if c, ok := connections[sourceDSN]; ok {
 			if c.DestOnly {
-				slog.Error("source use is not allowed by config", "source", sourceDSN)
-				os.Exit(1)
+				fatalSetup("source use is not allowed by config", "source", sourceDSN)
 			}
 
 			sourceDSN = connectionToDSN(c)
@@ -354,25 +425,22 @@ func main() {
 	// than rendered into whatever tz the server defaulted to.
 	sourceDSN, err := ensureUTCSession(sourceDSN)
 	if err != nil {
-		slog.Error("failed to apply UTC session tz to source DSN", "error", err)
-		os.Exit(1)
+		fatalSetup("failed to apply UTC session tz to source DSN", "error", err)
 	}
 
 	// Stop the source server from killing a streaming read conn when dest
 	// backpressure stalls our TCP read side.
 	sourceDSN, err = ensureLongSourceStream(sourceDSN)
 	if err != nil {
-		slog.Error("failed to apply net_write_timeout to source DSN", "error", err)
-		os.Exit(1)
+		fatalSetup("failed to apply net_write_timeout to source DSN", "error", err)
 	}
 
 	// source connection is the first argument
 	// this is where our rows are coming from
-	printSetupStatus(fmt.Sprintf("connecting to source %q...", sourceFriendly))
+	setupStatus(fmt.Sprintf("connecting to source %q...", sourceFriendly))
 	src, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
 	if err != nil {
-		slog.Error("failed to create source connection", "error", err, "sourceDSN", sourceDSN)
-		os.Exit(1)
+		fatalSetup("failed to create source connection", "error", err, "sourceDSN", sourceDSN)
 	}
 
 	src.DisableUnusedColumnWarnings = true
@@ -409,14 +477,13 @@ func main() {
 		destIsPath := strings.HasPrefix(destDSN, "file:")
 		destIsClipboard := strings.EqualFold(destDSN, "clipboard")
 
-		printSetupStatus(fmt.Sprintf("opening destination %q...", friendlyName))
+		setupStatus(fmt.Sprintf("opening destination %q...", friendlyName))
 
 		// resolve destination connection name
 		if connections != nil && !destIsPath && !destIsClipboard {
 			if c, ok := connections[destDSN]; ok {
 				if c.SourceOnly {
-					slog.Error("destination use is not allowed by config", "destination", destDSN)
-					os.Exit(1)
+					fatalSetup("destination use is not allowed by config", "destination", destDSN)
 				}
 
 				if c.Params == nil {
@@ -471,8 +538,7 @@ func main() {
 					if _, err := os.Stat(oldName); err == nil {
 						slog.Info("removing old directory", "directory", oldName)
 						if err := os.RemoveAll(oldName); err != nil {
-							slog.Error("failed to remove old directory", "error", err, "directory", oldName)
-							os.Exit(1)
+							fatalSetup("failed to remove old directory", "error", err, "directory", oldName)
 						}
 					}
 
@@ -480,22 +546,19 @@ func main() {
 					// so that we can rename our new directory to the correct name
 					slog.Info("moving directory", "from", finalName, "to", oldName)
 					if err := os.Rename(finalName, oldName); err != nil {
-						slog.Error("failed to rename directory", "error", err, "from", finalName, "to", oldName)
-						os.Exit(1)
+						fatalSetup("failed to rename directory", "error", err, "from", finalName, "to", oldName)
 					}
 
 					// and then we can rename our new directory to the correct name
 					slog.Info("moving directory", "from", name, "to", finalName)
 					if err := os.Rename(name, finalName); err != nil {
-						slog.Error("failed to rename directory", "error", err, "from", name, "to", finalName)
-						os.Exit(1)
+						fatalSetup("failed to rename directory", "error", err, "from", name, "to", finalName)
 					}
 
 					// and then we can remove the old directory
 					slog.Info("removing old directory", "directory", oldName)
 					if err := os.RemoveAll(oldName); err != nil {
-						slog.Error("failed to remove old directory", "error", err, "directory", oldName)
-						os.Exit(1)
+						fatalSetup("failed to remove old directory", "error", err, "directory", oldName)
 					}
 				}()
 			}
@@ -504,8 +567,7 @@ func main() {
 
 			db, err = mysql.NewLocalWriter(name)
 			if err != nil {
-				slog.Error("failed to create local writer", "error", err, "name", name)
-				os.Exit(1)
+				fatalSetup("failed to create local writer", "error", err, "name", name)
 			}
 		} else if destIsClipboard {
 			clipboardBuf = new(bytes.Buffer)
@@ -513,8 +575,7 @@ func main() {
 
 			db, err = mysql.NewWriter(clipboardBuf)
 			if err != nil {
-				slog.Error("failed to create writer", "error", err)
-				os.Exit(1)
+				fatalSetup("failed to create writer", "error", err)
 			}
 		} else {
 			// Anchor every dest pool conn to UTC, matching the source. Without
@@ -523,13 +584,11 @@ func main() {
 			// the 32-bit seconds range and 1067'ing on CREATE.
 			destDSN, err = ensureUTCSession(destDSN)
 			if err != nil {
-				slog.Error("failed to apply UTC session tz to destination DSN", "error", err, "destinationDSN", friendlyName)
-				os.Exit(1)
+				fatalSetup("failed to apply UTC session tz to destination DSN", "error", err, "destinationDSN", friendlyName)
 			}
 			db, err = mysql.NewFromDSN(destDSN, destDSN)
 			if err != nil {
-				slog.Error("failed to create destination connection", "error", err, "destinationDSN", destDSN)
-				os.Exit(1)
+				fatalSetup("failed to create destination connection", "error", err, "destinationDSN", destDSN)
 			}
 		}
 
@@ -549,14 +608,12 @@ func main() {
 		}
 
 		dsts = append(dsts, destInfo{db, destIsPath, destIsClipboard, clipboardBuf})
-		destFriendlyNames = append(destFriendlyNames, friendlyName)
 	}
 
-	printSetupStatus("resolving tables...")
+	setupStatus("resolving tables...")
 	tableNames, err := getTables(*aliasesFiles, *all, args, src)
 	if err != nil {
-		slog.Error("failed to get tables", "error", err, "aliasesFile", *aliasesFiles, "all", *all, "args", *args)
-		os.Exit(1)
+		fatalSetup("failed to get tables", "error", err, "aliasesFile", *aliasesFiles, "all", *all, "args", *args)
 	}
 
 	// get our tables ordered by the largest physical tables first
@@ -566,7 +623,7 @@ func main() {
 	// we collect into a slice so it can be reused across multiple destinations
 	var orderedTables []string
 	if len(*tableNames) > 0 {
-		printSetupStatus(fmt.Sprintf("ordering %d tables by size...", len(*tableNames)))
+		setupStatus(fmt.Sprintf("ordering %d tables by size...", len(*tableNames)))
 		tablesCh := make(chan string, len(*tableNames))
 		go func() {
 			defer close(tablesCh)
@@ -579,8 +636,7 @@ func main() {
 				"Tables": *tableNames,
 			})
 			if err != nil {
-				slog.Error("failed to select tables", "error", err)
-				os.Exit(1)
+				fatalSetup("failed to select tables", "error", err)
 			}
 		}()
 		for t := range tablesCh {
@@ -588,25 +644,21 @@ func main() {
 		}
 	}
 
-	printRunHeader(sourceFriendly, destFriendlyNames, orderedTables)
+	// Hand the full table list to the TUI in one shot. MySQL's ORDER BY in
+	// the resolve query waits for the full filesort before sending any
+	// rows, so a per-table dynamic registration would just flash all rows
+	// in within one render tick anyway — bulk-register and let the body
+	// flip from its "resolving" placeholder to the populated list.
+	u.SetTables(orderedTables)
+
+	// Non-TUI mode prints the source/dest/tables block + table list inline
+	// before the run starts. TUI mode skips this — the same information is
+	// replayed in scrollback after the user dismisses the TUI.
+	if !useTUI {
+		printRunHeader(sourceFriendly, destFriendlyNames, orderedTables)
+	}
 
 	var wg sync.WaitGroup
-
-	// In TUI mode, build the UI up front — every table registers as a row
-	// before any worker starts, so the first draw shows the full run. Route
-	// slog output through the UI's log writer (which tees to a temp file).
-	var u *ui
-	if useTUI {
-		var uiErr error
-		u, uiErr = newUI(sourceFriendly, destFriendlyNames, orderedTables)
-		if uiErr != nil {
-			slog.Error("failed to start TUI", "error", uiErr)
-			os.Exit(1)
-		}
-		defer u.Stop()
-		log.SetOutput(u.LogWriter())
-		go u.Run()
-	}
 
 	slog.Info("swoof run started",
 		"source", sourceFriendly,
@@ -876,6 +928,7 @@ func main() {
 						// Queued to run after all tables finish importing. Renames the temp
 						// table over the real one, re-adds constraints, and copies triggers.
 						delayedFuncs <- func() error {
+							finalizeStart := time.Now()
 							if !*dryRun {
 								for _, dst := range tableDsts {
 									if err := dst.Exec("drop table if exists`" + tableName + "`"); err != nil {
@@ -935,6 +988,9 @@ func main() {
 							// to "done" (green) now that the temp table has been
 							// swapped in and triggers copied. Nil-safe in non-TUI mode.
 							state.Finalize()
+							slog.Info("finalized table",
+								"tableName", tableName,
+								"duration", time.Since(finalizeStart).Round(time.Millisecond))
 							return nil
 						}
 					}
@@ -1409,6 +1465,24 @@ func main() {
 		u.MarkCompleted()
 		<-u.Done()
 		log.SetOutput(os.Stderr)
+
+		// Replay the setup phase + run summary into the user's terminal
+		// scrollback so they have a record of the run after tview's
+		// alt-screen has been torn down. Layout: blank line, the dim "→"
+		// status lines, blank line, the column-major table list, then the
+		// source/dest/tables labels (per the requested ordering), blank
+		// line, and finally the path to the full log file.
+		fmt.Fprintln(os.Stderr)
+		for _, msg := range setupStatuses {
+			printSetupStatus(msg)
+		}
+		fmt.Fprintln(os.Stderr)
+		if len(orderedTables) > 0 {
+			printTableColumns(orderedTables)
+			fmt.Fprintln(os.Stderr)
+		}
+		printRunSummaryLabels(sourceFriendly, destFriendlyNames, orderedTables)
+		fmt.Fprintln(os.Stderr)
 		if path := u.LogPath(); path != "" {
 			fmt.Fprintf(os.Stderr, "log: %s\n", path)
 		}

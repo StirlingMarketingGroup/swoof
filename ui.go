@@ -239,34 +239,109 @@ func (w *logWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// scrollBarView is a TextView with a one-column vertical scrollbar painted
+// on the right edge. tview v0.42.0 has no built-in scrollbar for TextView,
+// so we embed and override Draw to delegate then overlay the bar. The
+// rendered content reserves the rightmost inner column (see renderBody and
+// renderFooter) so the bar never sits on top of text. Used for both the
+// table list and the log pane.
+type scrollBarView struct {
+	*tview.TextView
+}
+
+func newScrollBarView() *scrollBarView {
+	return &scrollBarView{TextView: tview.NewTextView()}
+}
+
+// Draw delegates to the embedded TextView, then paints a scrollbar in the
+// rightmost column of the inner rect when the content overflows the visible
+// height. Track is dim, thumb picks up the body's border color so it stays
+// in sync with the green completion tint.
+func (s *scrollBarView) Draw(screen tcell.Screen) {
+	s.TextView.Draw(screen)
+
+	x, y, w, h := s.GetInnerRect()
+	if w <= 0 || h <= 0 {
+		return
+	}
+
+	// Total displayed lines = number of '\n' + 1, since SetWrap(false) means
+	// each newline-separated chunk is exactly one screen row.
+	text := s.GetText(false)
+	total := strings.Count(text, "\n") + 1
+	if total <= h {
+		return
+	}
+
+	offset, _ := s.GetScrollOffset()
+	maxOffset := total - h
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+
+	// Thumb height is proportional to visible/total; clamp to [1, h] so the
+	// bar is always visible and never larger than the track.
+	thumbH := min(max(h*h/total, 1), h)
+
+	thumbY := 0
+	if maxOffset > 0 && h > thumbH {
+		thumbY = offset * (h - thumbH) / maxOffset
+	}
+
+	// Match the thumb to the body's border color so the green completion
+	// tint flows through; track stays dim regardless.
+	thumbColor := s.GetBorderColor()
+	trackStyle := tcell.StyleDefault.Foreground(tcell.ColorGray).Background(tcell.ColorDefault)
+	thumbStyle := tcell.StyleDefault.Foreground(thumbColor).Background(tcell.ColorDefault)
+
+	sx := x + w - 1
+	for i := range h {
+		ch := '│'
+		st := trackStyle
+		if i >= thumbY && i < thumbY+thumbH {
+			ch = '█'
+			st = thumbStyle
+		}
+		screen.SetContent(sx, y+i, ch, nil, st)
+	}
+}
+
 type ui struct {
-	app                    *tview.Application
-	flex                   *tview.Flex
-	header                 *tview.TextView
-	body                   *tview.TextView
-	footer                 *tview.TextView
-	states                 []*tableState
-	byName                 map[string]*tableState
-	logRing                *ringBuffer
-	logFile                *os.File
-	logWriter              *logWriter
-	fatal                  chan error
-	startedAt              time.Time
-	stopOnce               sync.Once
-	stopped                atomic.Bool
-	firstErr               atomic.Pointer[error]
-	source                 string
-	dests                  []string
-	done                   chan struct{}
-	completed              atomic.Bool
-	completedAt            atomic.Int64
-	postCompletionRendered atomic.Bool
+	app         *tview.Application
+	flex        *tview.Flex
+	header      *tview.TextView
+	body        *scrollBarView
+	footer      *scrollBarView
+	states      []*tableState
+	byName      map[string]*tableState
+	logRing     *ringBuffer
+	logFile     *os.File
+	logWriter   *logWriter
+	startedAt   time.Time
+	stopOnce    sync.Once
+	stopped     atomic.Bool
+	firstErr    atomic.Pointer[error]
+	source      string
+	dests       []string
+	done        chan struct{}
+	completed   atomic.Bool
+	completedAt atomic.Int64
+
+	// statesMu guards states/byName. SetTables (called once after resolve)
+	// can race with the render tick reading the slice — Lock to write,
+	// RLock to read. Workers only call State after SetTables completes, so
+	// they don't contend.
+	statesMu sync.RWMutex
 }
 
 // newUI constructs the TUI but does NOT start it. Call Run to drive the event
-// loop. The returned ui registers all tables up front so the body renders
-// every row immediately on the first draw.
-func newUI(source string, dests []string, tableNames []string) (*ui, error) {
+// loop. The body starts empty (with a "Resolving tables…" placeholder) and
+// SetTables is called once after the resolve query returns the full
+// size-descending list.
+func newUI(source string, dests []string) (*ui, error) {
 	// Inherit the terminal's own colors instead of tview's default
 	// black-bg/white-fg theme, so swoof blends with whatever color scheme
 	// the user has configured (light themes, transparent terminals, etc.).
@@ -292,23 +367,15 @@ func newUI(source string, dests []string, tableNames []string) (*ui, error) {
 
 	u := &ui{
 		app:       tview.NewApplication(),
-		states:    make([]*tableState, 0, len(tableNames)),
-		byName:    make(map[string]*tableState, len(tableNames)),
+		byName:    make(map[string]*tableState),
 		logRing:   newRingBuffer(500),
 		logFile:   logFile,
-		fatal:     make(chan error, 1),
 		startedAt: time.Now(),
 		source:    source,
 		dests:     dests,
 		done:      make(chan struct{}),
 	}
 	u.logWriter = &logWriter{ring: u.logRing, file: logFile}
-
-	for _, name := range tableNames {
-		st := newTableState(name)
-		u.states = append(u.states, st)
-		u.byName[name] = st
-	}
 
 	_, current := moduleVersion()
 	if current == "" {
@@ -317,9 +384,11 @@ func newUI(source string, dests []string, tableNames []string) (*ui, error) {
 
 	u.header = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
 	u.header.SetBorder(true).SetTitle(fmt.Sprintf("swoof %s", current))
-	u.body = tview.NewTextView().SetDynamicColors(true).SetWrap(false).SetScrollable(true)
+	u.body = newScrollBarView()
+	u.body.SetDynamicColors(true).SetWrap(false).SetScrollable(true)
 	u.body.SetBorder(true).SetTitle(" tables ")
-	u.footer = tview.NewTextView().SetDynamicColors(true).SetWrap(false).SetScrollable(true)
+	u.footer = newScrollBarView()
+	u.footer.SetDynamicColors(true).SetWrap(false).SetScrollable(true)
 	u.footer.SetBorder(true).SetTitle(" log ")
 
 	u.flex = tview.NewFlex().SetDirection(tview.FlexRow).
@@ -330,6 +399,19 @@ func newUI(source string, dests []string, tableNames []string) (*ui, error) {
 	u.app.SetRoot(u.flex, true).EnableMouse(false)
 
 	u.app.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		// Tab / Shift-Tab swap focus between the body (tables) and the
+		// footer (log). Each pane is independently scrollable; this is the
+		// only way the user can move into the log pane to scroll back
+		// through earlier entries.
+		if ev.Key() == tcell.KeyTab || ev.Key() == tcell.KeyBacktab {
+			if u.app.GetFocus() == u.footer {
+				u.app.SetFocus(u.body)
+			} else {
+				u.app.SetFocus(u.footer)
+			}
+			return nil
+		}
+
 		isExit := ev.Key() == tcell.KeyCtrlC ||
 			(ev.Key() == tcell.KeyRune && (ev.Rune() == 'q' || ev.Rune() == 'Q'))
 		if !isExit {
@@ -350,7 +432,34 @@ func newUI(source string, dests []string, tableNames []string) (*ui, error) {
 
 func (u *ui) LogWriter() io.Writer { return u.logWriter }
 
-func (u *ui) State(name string) *tableState { return u.byName[name] }
+// SetTables registers the run's table list in one shot, replacing any prior
+// list. Called once after the resolve query returns its full size-descending
+// result. Before this fires the body shows a "resolving" placeholder; after,
+// it renders one row per table. Safe to call concurrently with the render
+// loop.
+func (u *ui) SetTables(names []string) {
+	if u == nil {
+		return
+	}
+	u.statesMu.Lock()
+	defer u.statesMu.Unlock()
+	u.states = make([]*tableState, 0, len(names))
+	u.byName = make(map[string]*tableState, len(names))
+	for _, n := range names {
+		st := newTableState(n)
+		u.states = append(u.states, st)
+		u.byName[n] = st
+	}
+}
+
+func (u *ui) State(name string) *tableState {
+	if u == nil {
+		return nil
+	}
+	u.statesMu.RLock()
+	defer u.statesMu.RUnlock()
+	return u.byName[name]
+}
 
 // LogPath returns the path of the temp log file written during the run.
 func (u *ui) LogPath() string {
@@ -364,11 +473,8 @@ func (u *ui) LogPath() string {
 // the TUI. Idempotent and goroutine-safe. Used both by worker-driven failures
 // and by the Ctrl+C / q input handler (which passes errInterrupted).
 func (u *ui) Fatal(err error) {
-	if err != nil && u.firstErr.CompareAndSwap(nil, &err) {
-		select {
-		case u.fatal <- err:
-		default:
-		}
+	if err != nil {
+		u.firstErr.CompareAndSwap(nil, &err)
 	}
 	u.Stop()
 }
@@ -385,11 +491,12 @@ func (u *ui) FirstError() error {
 func (u *ui) Done() <-chan struct{} { return u.done }
 
 // MarkCompleted switches the UI into completion mode. The header swaps to a
-// "Swoofed!" banner with a "Press Q to exit" prompt and the elapsed time
-// freezes; the body and footer render once more (with their final content)
-// then stop being touched, so the user can scroll either pane without the
-// next render tick yanking their position. Q / Ctrl+C now stop cleanly
-// instead of recording errInterrupted.
+// green "Swoofed!" banner and the elapsed time freezes; the footer pins a
+// bold "Press Q to exit" line at the bottom; borders blink yellow→green for
+// a beat then settle on green. Re-renders keep firing every tick so terminal
+// resizes still reflow correctly, and TextView.SetText preserves scroll
+// position so the user can still page through either pane. Q / Ctrl+C now
+// stop cleanly instead of recording errInterrupted.
 //
 // We deliberately don't QueueUpdateDraw an immediate render here — if the
 // user already pressed Q during finalization the event loop has stopped
@@ -443,11 +550,19 @@ func (u *ui) Run() {
 }
 
 func (u *ui) render() {
-	// Once we've drawn the completion frame we leave the body and footer
-	// alone — calling SetText again would reset the user's scroll position.
-	if u.postCompletionRendered.Load() {
-		return
+	// Pane focus marker is updated every tick — even after the body/footer
+	// content has been frozen on completion, Tab cycling should still flip
+	// the ▸ from one title to the other.
+	focused := u.app.GetFocus()
+	bodyTitle := "  tables "
+	footerTitle := "  log "
+	if focused == u.footer {
+		footerTitle = " ▸ log "
+	} else {
+		bodyTitle = " ▸ tables "
 	}
+	u.body.SetTitle(bodyTitle)
+	u.footer.SetTitle(footerTitle)
 
 	_, h, err := term.GetSize(int(os.Stdout.Fd()))
 	if err == nil {
@@ -455,25 +570,68 @@ func (u *ui) render() {
 		u.flex.ResizeItem(u.footer, footerH, 0)
 	}
 
+	u.statesMu.RLock()
 	snaps := make([]tableSnapshot, len(u.states))
 	for i, s := range u.states {
 		snaps[i] = s.snapshot()
 	}
+	u.statesMu.RUnlock()
 
 	u.renderHeader(snaps)
 	u.renderBody(snaps)
 	u.renderFooter()
 
 	if u.completed.Load() {
-		// Tint every pane's border green so the "done" state is obvious at
-		// a glance even before the user reads the banner. Done on the last
-		// frame only — postCompletionRendered short-circuits the next tick,
-		// so the border color sticks until exit.
-		u.header.SetBorderColor(tcell.ColorGreen)
-		u.body.SetBorderColor(tcell.ColorGreen)
-		u.footer.SetBorderColor(tcell.ColorGreen)
-		u.postCompletionRendered.Store(true)
+		// Brief celebratory blink: yellow→green→yellow→green at blinkPhase
+		// each (4 phases total), then settle on green. After the blink
+		// SetBorderColor(green) keeps being called every tick — idempotent,
+		// so it just stays green for free.
+		const blinkPhase = 125 * time.Millisecond
+		const blinkDuration = 4 * blinkPhase
+		var sinceCompleted time.Duration
+		if t := u.completedAt.Load(); t > 0 {
+			sinceCompleted = time.Since(time.Unix(0, t))
+		}
+		c := tcell.ColorGreen
+		// Phase 0 = yellow, 1 = green, 2 = yellow, 3 = green.
+		if sinceCompleted < blinkDuration && int(sinceCompleted/blinkPhase)%2 == 0 {
+			c = tcell.ColorYellow
+		}
+		u.header.SetBorderColor(c)
+		u.body.SetBorderColor(c)
+		u.footer.SetBorderColor(c)
 	}
+}
+
+// centeredLine builds a horizontally-centered tview-tagged line by
+// alternating `staticColor`-tinted strings with bold-white values. parts
+// must be: string, value, string, value, ... (or any sequence; everything
+// is rendered with single-space separators). Strings render in
+// staticColor, every other type renders in [white::b]. Centering pad is
+// computed against the plain (tag-stripped) form.
+func centeredLine(termW int, staticColor string, parts ...any) string {
+	var plain, b strings.Builder
+	for i, p := range parts {
+		if i > 0 {
+			plain.WriteByte(' ')
+			b.WriteByte(' ')
+		}
+		switch v := p.(type) {
+		case string:
+			plain.WriteString(v)
+			b.WriteString("[" + staticColor + "]")
+			b.WriteString(v)
+			b.WriteString("[-:-:-]")
+		default:
+			s := fmt.Sprint(v)
+			plain.WriteString(s)
+			b.WriteString("[white::b]")
+			b.WriteString(s)
+			b.WriteString("[-:-:-]")
+		}
+	}
+	pad := max((termW-utf8.RuneCountInString(plain.String()))/2, 0)
+	return strings.Repeat(" ", pad) + b.String()
 }
 
 func (u *ui) renderHeader(snaps []tableSnapshot) {
@@ -514,25 +672,26 @@ func (u *ui) renderHeader(snaps []tableSnapshot) {
 	}
 
 	// Line 1: centered semantic one-liner summarising the run. Static text
-	// is dim gray; values are bold white. Each value is wrapped as
+	// gets `staticColor`; values are bold white. Each value is wrapped as
 	// `[white::b]VALUE[-:-:-]` so the bold attr always resets cleanly, and
-	// `[gray]` re-applies gray for the next static run after each reset.
-	// In completion mode the static text turns green; the "Press Q to exit"
-	// prompt lives in the log pane (renderFooter) so it can't be missed.
+	// the static color is re-applied after each reset. In completion mode
+	// the static color turns green; the "Press Q to exit" prompt lives in
+	// the log pane (renderFooter) so it can't be missed.
 	destStr := strings.Join(u.dests, ", ")
-	var summaryPlain, line1 string
-	if u.completed.Load() {
-		summaryPlain = fmt.Sprintf("Swoofed %d tables from %s to %s in %s",
-			len(snaps), u.source, destStr, elapsed)
-		summaryPad := max((termW-utf8.RuneCountInString(summaryPlain))/2, 0)
-		line1 = fmt.Sprintf("%s[green::b]Swoofed [white::b]%d[-:-:-][green::b] tables from [white::b]%s[-:-:-][green::b] to [white::b]%s[-:-:-][green::b] in [white::b]%s[-:-:-]",
-			strings.Repeat(" ", summaryPad), len(snaps), u.source, destStr, elapsed)
-	} else {
-		summaryPlain = fmt.Sprintf("Swoofing %d tables from %s to %s - Elapsed time: %s",
-			len(snaps), u.source, destStr, elapsed)
-		summaryPad := max((termW-utf8.RuneCountInString(summaryPlain))/2, 0)
-		line1 = fmt.Sprintf("%s[gray]Swoofing [white::b]%d[-:-:-][gray] tables from [white::b]%s[-:-:-][gray] to [white::b]%s[-:-:-][gray] - Elapsed time: [white::b]%s[-:-:-]",
-			strings.Repeat(" ", summaryPad), len(snaps), u.source, destStr, elapsed)
+	var line1 string
+	switch {
+	case u.completed.Load():
+		line1 = centeredLine(termW, "green::b",
+			"Swoofed", len(snaps), "tables from", u.source, "to", destStr, "in", elapsed)
+	case len(snaps) == 0:
+		// Resolve phase hasn't registered any tables yet; placeholder line
+		// keeps the header centered and free of "Swoofing 0 tables" weirdness
+		// while connections are being opened.
+		line1 = centeredLine(termW, "gray",
+			"Connecting to", u.source, "and resolving tables - Elapsed time:", elapsed)
+	default:
+		line1 = centeredLine(termW, "gray",
+			"Swoofing", len(snaps), "tables from", u.source, "to", destStr, "- Elapsed time:", elapsed)
 	}
 
 	// Line 2: four status counts evenly distributed across the width.
@@ -574,9 +733,31 @@ func (u *ui) renderBody(snaps []tableSnapshot) {
 	if err != nil || width < 40 {
 		width = 120
 	}
+
+	// SetTables hasn't fired yet — show a centered "resolving" placeholder
+	// so the body isn't a blank box while connections open and the source
+	// runs its information_schema query. The render loop will flip back to
+	// the per-row list as soon as SetTables hands us the full list.
+	if len(snaps) == 0 && !u.completed.Load() {
+		const msg = "Resolving tables on "
+		const dotCadence = 125 * time.Millisecond
+		// Cycle the ellipsis between 1, 2, and 3 dots so the pane visibly
+		// *looks* like it's working. Trailing spaces keep the message
+		// width constant so the centering pad below doesn't jiggle.
+		dotCount := int(time.Since(u.startedAt)/dotCadence)%3 + 1
+		tail := strings.Repeat(".", dotCount) + strings.Repeat(" ", 3-dotCount)
+		plainLen := len(msg) + len(u.source) + 3
+		pad := max((width-2-plainLen)/2, 0)
+		u.body.SetText(strings.Repeat("\n", 2) + strings.Repeat(" ", pad) +
+			"[gray]" + msg + "[white::b]" + tview.Escape(u.source) + "[-:-:-][gray]" + tail + "[-]")
+		return
+	}
+
 	// Body has a border; tview draws left/right border columns, so every row
-	// has two fewer usable columns than the raw terminal.
-	width -= 2
+	// has two fewer usable columns than the raw terminal. We reserve one more
+	// column on the right for the scrollbar painted by scrollBarView.Draw,
+	// so the bar never sits on top of row text.
+	width -= 3
 
 	// Fixed caps for the two variable-width columns so widths don't bounce
 	// around as tables finish or retry. Names longer than the cap are
@@ -779,15 +960,22 @@ func (u *ui) renderFooter() {
 		if err != nil || termW < 20 {
 			termW = 120
 		}
-		// Footer has a border (2 cols) — usable width is termW-2.
-		pad := max((termW-2-len(prompt))/2, 0)
+		// Footer has a border (2 cols) and reserves one more column on the
+		// right for the scrollbar painted by scrollBarView.Draw, so the
+		// usable width for centering is termW-3.
+		pad := max((termW-3-len(prompt))/2, 0)
 		if text != "" {
 			text += "\n\n"
 		}
 		text += strings.Repeat(" ", pad) + "[yellow::b]" + prompt + "[-:-:-]"
 	}
 	u.footer.SetText(text)
-	u.footer.ScrollToEnd()
+	// Auto-scroll only when the user isn't focused on the log pane —
+	// otherwise the next tick would yank their cursor back to the latest
+	// entry whenever a new line streams in.
+	if u.app.GetFocus() != u.footer {
+		u.footer.ScrollToEnd()
+	}
 }
 
 // logLevels maps the text levels emitted by slog's default handler to tview
@@ -804,11 +992,27 @@ var logLevels = map[string]string{
 // and contain arbitrary content, so we don't try to parse them.
 var logKeyPattern = regexp.MustCompile(`(^|\s)([A-Za-z_][A-Za-z0-9_.-]*)=`)
 
+// logMessageColors maps known slog message texts (the literal first arg to
+// slog.Info/Warn/Error) to a tview color name applied to the message in the
+// log pane. Mirrors the per-row colors used in the body so the lifecycle of
+// a table — running (aqua) → imported (blue) → done (green) — reads the same
+// way in both panes. Messages not in this map keep the default text color.
+var logMessageColors = map[string]string{
+	"starting table":              "aqua",
+	"finished table":              "blue",
+	"finalized table":             "green",
+	"recovered after retries":     "green",
+	"finalizing table imports...": "blue",
+	"table imports complete":      "green",
+	"finished importing tables":   "green",
+}
+
 // colorizeLogLine applies inline tview color tags to a raw slog line of the
 // form `YYYY/MM/DD HH:MM:SS LEVEL msg key=value…`. Timestamp is dim, level
-// is colored by severity, attribute keys are dim, everything else keeps its
-// default color. All raw text is escaped against tview's tag parser so
-// bracket chars in SQL errors can't accidentally trigger color tags.
+// is colored by severity, the message is colored when it matches an entry
+// in logMessageColors, and attribute keys are dim. All raw text is escaped
+// against tview's tag parser so bracket chars in SQL errors can't trigger
+// color tags.
 func colorizeLogLine(raw string) string {
 	// Minimum prefix is "YYYY/MM/DD HH:MM:SS LEVEL " = 25 chars.
 	if len(raw) < 25 || raw[4] != '/' || raw[7] != '/' || raw[10] != ' ' ||
@@ -831,11 +1035,24 @@ func colorizeLogLine(raw string) string {
 		return tview.Escape(raw)
 	}
 
-	tailEscaped := tview.Escape(tail)
-	tailColored := logKeyPattern.ReplaceAllString(tailEscaped, "$1[gray]$2[-]=")
+	// Split tail into the free-text message and the trailing key=value
+	// attributes. The message ends just before the first " key=" match;
+	// slog.Info("foo bar", ...) yields msg="foo bar" with attrs after it.
+	msg, attrs := tail, ""
+	if loc := logKeyPattern.FindStringIndex(tail); loc != nil {
+		msg = strings.TrimRight(tail[:loc[0]], " ")
+		attrs = tail[loc[0]:]
+	}
 
-	return fmt.Sprintf("[gray]%s[-] [%s::b]%s[-:-:-] %s",
-		ts, logLevels[level], level, tailColored)
+	msgRendered := tview.Escape(msg)
+	if c, ok := logMessageColors[msg]; ok {
+		msgRendered = fmt.Sprintf("[%s::b]%s[-:-:-]", c, msgRendered)
+	}
+
+	attrsColored := logKeyPattern.ReplaceAllString(tview.Escape(attrs), "$1[gray]$2[-]=")
+
+	return fmt.Sprintf("[gray]%s[-] [%s::b]%s[-:-:-] %s%s",
+		ts, logLevels[level], level, msgRendered, attrsColored)
 }
 
 func statusColor(s tableStatus) string {
