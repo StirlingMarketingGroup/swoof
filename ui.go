@@ -1100,9 +1100,16 @@ func statusRank(s tableStatus) int {
 func statusRune(s tableStatus) string {
 	switch s {
 	case statusRunning:
-		return "⟳"
+		// Black right-pointing triangle (U+25B6) — "playing/active". Distinct
+		// from the retrying arrow so the two states are easy to tell apart at
+		// a glance.
+		return "▶"
 	case statusRetrying:
-		return "⏳"
+		// Clockwise open-circle arrow (U+21BB) — single-width on every
+		// terminal. Replaces the hourglass U+23F3, which renders
+		// double-width on macOS Terminal/iTerm2 and pushed the row layout
+		// out of alignment.
+		return "↻"
 	case statusDone, statusFinalized:
 		return "✓"
 	case statusFailed:
