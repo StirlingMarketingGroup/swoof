@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/Ompluscator/dynamic-struct v1.3.0
-	github.com/StirlingMarketingGroup/cool-mysql v0.0.25
+	github.com/StirlingMarketingGroup/cool-mysql v0.0.28
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/fatih/color v1.19.0
 	github.com/go-sql-driver/mysql v1.10.0
@@ -42,7 +42,6 @@ require (
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.26.0 // indirect
-	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/exp v0.0.0-20190731235908-ec7cb31e5a56 // indirect
 	golang.org/x/image v0.38.0 // indirect
 	golang.org/x/mobile v0.0.0-20250606033058-a2a15c67f36f // indirect
