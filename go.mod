@@ -11,7 +11,7 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/posener/cmd v1.3.4
 	github.com/vbauerster/mpb/v8 v8.12.1
-	golang.design/x/clipboard v0.7.1
+	golang.design/x/clipboard v0.8.0
 	golang.org/x/mod v0.37.0
 	golang.org/x/sync v0.21.0
 	gopkg.in/yaml.v2 v2.4.0
@@ -26,6 +26,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+	github.com/ebitengine/purego v0.10.1 // indirect
 	github.com/fatih/structtag v1.2.0 // indirect
 	github.com/go-redsync/redsync/v4 v4.11.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
@@ -42,6 +43,7 @@ require (
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.26.0 // indirect
+	golang.design/x/x11 v0.2.0 // indirect
 	golang.org/x/exp v0.0.0-20190731235908-ec7cb31e5a56 // indirect
 	golang.org/x/image v0.38.0 // indirect
 	golang.org/x/mobile v0.0.0-20250606033058-a2a15c67f36f // indirect
