@@ -13,7 +13,7 @@ require (
 	github.com/vbauerster/mpb/v8 v8.12.1
 	golang.design/x/clipboard v0.7.1
 	golang.org/x/mod v0.37.0
-	golang.org/x/sync v0.20.0
+	golang.org/x/sync v0.21.0
 	gopkg.in/yaml.v2 v2.4.0
 )
 
