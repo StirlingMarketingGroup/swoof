@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/Ompluscator/dynamic-struct v1.3.0
-	github.com/StirlingMarketingGroup/cool-mysql v0.0.30
+	github.com/StirlingMarketingGroup/cool-mysql v0.0.31
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/fatih/color v1.19.0
 	github.com/go-sql-driver/mysql v1.10.0
