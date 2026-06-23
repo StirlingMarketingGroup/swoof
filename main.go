@@ -7,6 +7,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -23,14 +24,14 @@ import (
 	mysql "github.com/StirlingMarketingGroup/cool-mysql"
 	"github.com/cenkalti/backoff/v5"
 	"github.com/fatih/color"
+	"github.com/gen2brain/beeep"
 	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/pkg/errors"
 	"github.com/posener/cmd"
-	"github.com/vbauerster/mpb/v8"
-	"github.com/vbauerster/mpb/v8/decor"
 	"golang.design/x/clipboard"
 	"golang.org/x/mod/semver"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/term"
 )
 
 const modulePath = "github.com/StirlingMarketingGroup/swoof"
@@ -43,7 +44,7 @@ var (
 var (
 	root = cmd.New()
 
-	aliasesFiles = root.String("a", confDir+"/swoof/aliases.yaml", "your alaises file")
+	aliasesFiles = root.String("a", confDir+"/swoof/aliases.yaml", "your aliases file")
 
 	connectionsFile = root.String("c", confDir+"/swoof/connections.yaml", "your connections file")
 
@@ -55,7 +56,7 @@ var (
 
 	insertIgnoreInto = root.Bool("insert-ignore", false, "inserts into the existing table without overwriting the existing rows")
 
-	dryRyn = root.Bool("dry-run", false, "doesn't actually execute any queries that have an effect")
+	dryRun = root.Bool("dry-run", false, "doesn't actually execute any queries that have an effect")
 
 	verbose = root.Bool("v", false, "writes all queries to stdout")
 
@@ -66,6 +67,8 @@ var (
 	procs = root.Bool("procs", false, "imports all stored procedures after tables, funcs, and views")
 
 	noProgressBars = root.Bool("no-progress", false, "disables the progress bars")
+
+	showVersion = root.Bool("version", false, "prints the version and exits")
 
 	skipCount = root.Bool("skip-count", false, "skips the count query for each table, which can be slow for large tables")
 
@@ -136,8 +139,9 @@ func maybeReportNewVersion() {
 		return
 	}
 
-	label := color.New(color.FgHiYellow).Sprint("⚠ update available")
-	fmt.Fprintf(os.Stderr, "%s: swoof %s is available (current %s). https://github.com/StirlingMarketingGroup/swoof/releases/latest\n", label, latestRaw, current)
+	label := color.New(color.FgHiYellow).Sprint("\n⚠ update available")
+	newVersion := color.New(color.FgHiGreen).Add(color.Bold).Sprintf("swoof %s", latestRaw)
+	fmt.Fprintf(os.Stderr, "%s: %s is available!\nhttps://github.com/StirlingMarketingGroup/swoof/releases/latest\n\n", label, newVersion)
 }
 
 func moduleVersion() (string, string) {
@@ -173,6 +177,109 @@ func isNewerVersion(latest, current string) bool {
 	return semver.Compare(latestSemver, currentSemver) > 0
 }
 
+// Called before the TUI starts so it stays in scrollback after tview's
+// alt-screen tears down.
+func printTitle() {
+	_, current := moduleVersion()
+	if current == "" {
+		current = "dev"
+	}
+	labelGreen := color.New(color.FgHiGreen).Add(color.Bold).SprintFunc()
+	value := color.New(color.FgHiWhite).SprintFunc()
+	dim := color.New(color.FgHiBlack).SprintFunc()
+	fmt.Printf("%s %s\n", labelGreen("swoof"), value(current))
+	fmt.Printf("%s\n", dim(fmt.Sprintf("Copyright © %d Stirling Marketing Group", time.Now().Year())))
+	fmt.Printf("%s\n", dim("Licensed under MIT"))
+}
+
+func printRunHeader(source string, destinations []string, tables []string) {
+	printRunSummaryLabels(source, destinations, tables)
+	if len(tables) == 0 {
+		return
+	}
+	fmt.Println()
+	printTableColumns(tables)
+	fmt.Println()
+}
+
+// Split from the table list so the post-TUI summary can place the labels
+// below the names (different ordering than non-TUI's printRunHeader).
+func printRunSummaryLabels(source string, destinations []string, tables []string) {
+	labelCyan := color.New(color.FgHiCyan).SprintFunc()
+	value := color.New(color.FgHiWhite).SprintFunc()
+
+	fmt.Printf("%s %s\n", labelCyan("source:       "), value(source))
+
+	destLabel := "destination:  "
+	if len(destinations) > 1 {
+		destLabel = "destinations:"
+	}
+	fmt.Printf("%s %s\n", labelCyan(destLabel), value(strings.Join(destinations, ", ")))
+
+	if len(tables) == 0 {
+		fmt.Printf("%s %s\n", labelCyan("tables:       "), value("none"))
+		return
+	}
+	fmt.Printf("%s %s\n", labelCyan("tables:       "), value(fmt.Sprintf("%d total", len(tables))))
+}
+
+func printTableColumns(tables []string) {
+	const indent = 2
+	const gutter = 2
+	indentStr := strings.Repeat(" ", indent)
+	colorize := color.New(color.FgHiWhite).SprintFunc()
+
+	longest := 0
+	for _, t := range tables {
+		if len(t) > longest {
+			longest = len(t)
+		}
+	}
+
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || width-indent < longest {
+		for _, t := range tables {
+			fmt.Printf("%s%s\n", indentStr, colorize(t))
+		}
+		return
+	}
+
+	colWidth := longest + gutter
+	cols := max((width-indent+gutter)/colWidth, 1)
+	cols = min(cols, len(tables))
+	rows := (len(tables) + cols - 1) / cols
+
+	for r := range rows {
+		fmt.Print(indentStr)
+		actualCols := 0
+		for c := range cols {
+			if c*rows+r < len(tables) {
+				actualCols++
+			}
+		}
+		for c := range actualCols {
+			name := tables[c*rows+r]
+			if c < actualCols-1 {
+				fmt.Print(colorize(fmt.Sprintf("%-*s", colWidth, name)))
+			} else {
+				fmt.Print(colorize(name))
+			}
+		}
+		fmt.Println()
+	}
+}
+
+// Best-effort: silently no-ops where beeep can't reach a notification
+// service (SSH-to-headless, CI, etc.).
+func notifyDesktop(title, message string) {
+	_ = beeep.Notify(title, message, "")
+}
+
+func printSetupStatus(msg string) {
+	prefix := color.New(color.FgHiBlack).Sprint("→")
+	fmt.Fprintf(os.Stderr, "%s %s\n", prefix, msg)
+}
+
 func ensureSemverPrefix(v string) string {
 	v = strings.TrimSpace(v)
 	if v == "" {
@@ -194,6 +301,16 @@ func main() {
 	// were given something that makes sense
 	root.ParseArgs(os.Args...)
 
+	if *showVersion {
+		_, current := moduleVersion()
+		if current == "" {
+			current = "unknown"
+		}
+		fmt.Println(current)
+		os.Exit(0)
+	}
+
+	printTitle()
 	maybeReportNewVersion()
 
 	if len(*args) < 2 {
@@ -205,7 +322,13 @@ func main() {
 		*noProgressBars = true
 	}
 
-	if *noProgressBars {
+	// The TUI is the primary rendering path. It's disabled when the user
+	// explicitly asks for plain output (-no-progress), when -verbose is set
+	// (every query would flood the log pane), or when stdout is not a TTY
+	// (piping / redirection). In the non-TUI path we also skip the COUNT(*)
+	// per table since there's no bar to feed it into.
+	useTUI := !*noProgressBars && !*verbose && term.IsTerminal(int(os.Stdout.Fd()))
+	if !useTUI {
 		*skipCount = true
 	}
 
@@ -214,7 +337,49 @@ func main() {
 	var guard = make(chan struct{}, *threads)
 
 	sourceDSN := (*args)[0]
+	sourceFriendly := sourceDSN
 	destDSNs := strings.Split((*args)[1], ",")
+	destFriendlyNames := make([]string, 0, len(destDSNs))
+	for _, raw := range destDSNs {
+		destFriendlyNames = append(destFriendlyNames, strings.TrimSpace(raw))
+	}
+
+	// TUI starts before connection work so progress lands in the log pane.
+	// setupStatuses captures messages for post-TUI scrollback replay —
+	// alt-screen output is otherwise lost on teardown.
+	var u *ui
+	var setupStatuses []string
+	if useTUI {
+		var uiErr error
+		u, uiErr = newUI(sourceFriendly, destFriendlyNames)
+		if uiErr != nil {
+			slog.Error("failed to start TUI", "error", uiErr)
+			os.Exit(1)
+		}
+		defer u.Stop()
+		log.SetOutput(u.LogWriter())
+		go u.Run()
+	}
+
+	setupStatus := func(msg string) {
+		if useTUI {
+			setupStatuses = append(setupStatuses, msg)
+			slog.Info(msg)
+		} else {
+			printSetupStatus(msg)
+		}
+	}
+
+	// For post-newUI setup-phase os.Exits — tears down the TUI first so the
+	// error lands on the user's terminal. Worker-phase errors use u.Fatal.
+	fatalSetup := func(msg string, args ...any) {
+		if u != nil {
+			u.Stop()
+		}
+		log.SetOutput(os.Stderr)
+		slog.Error(msg, args...)
+		os.Exit(1)
+	}
 
 	blue := color.New(color.FgBlue).SprintFunc()
 	red := color.New(color.FgRed).SprintFunc()
@@ -227,8 +392,7 @@ func main() {
 	if connections != nil {
 		if c, ok := connections[sourceDSN]; ok {
 			if c.DestOnly {
-				slog.Error("source use is not allowed by config", "source", sourceDSN)
-				os.Exit(1)
+				fatalSetup("source use is not allowed by config", "source", sourceDSN)
 			}
 
 			sourceDSN = connectionToDSN(c)
@@ -240,24 +404,22 @@ func main() {
 	// than rendered into whatever tz the server defaulted to.
 	sourceDSN, err := ensureUTCSession(sourceDSN)
 	if err != nil {
-		slog.Error("failed to apply UTC session tz to source DSN", "error", err)
-		os.Exit(1)
+		fatalSetup("failed to apply UTC session tz to source DSN", "error", err)
 	}
 
 	// Stop the source server from killing a streaming read conn when dest
 	// backpressure stalls our TCP read side.
 	sourceDSN, err = ensureLongSourceStream(sourceDSN)
 	if err != nil {
-		slog.Error("failed to apply net_write_timeout to source DSN", "error", err)
-		os.Exit(1)
+		fatalSetup("failed to apply net_write_timeout to source DSN", "error", err)
 	}
 
 	// source connection is the first argument
 	// this is where our rows are coming from
+	setupStatus(fmt.Sprintf("connecting to source %q...", sourceFriendly))
 	src, err := mysql.NewFromDSN(sourceDSN, sourceDSN)
 	if err != nil {
-		slog.Error("failed to create source connection", "error", err, "sourceDSN", sourceDSN)
-		os.Exit(1)
+		fatalSetup("failed to create source connection", "error", err, "sourceDSN", sourceDSN)
 	}
 
 	src.DisableUnusedColumnWarnings = true
@@ -294,12 +456,13 @@ func main() {
 		destIsPath := strings.HasPrefix(destDSN, "file:")
 		destIsClipboard := strings.EqualFold(destDSN, "clipboard")
 
+		setupStatus(fmt.Sprintf("opening destination %q...", friendlyName))
+
 		// resolve destination connection name
 		if connections != nil && !destIsPath && !destIsClipboard {
 			if c, ok := connections[destDSN]; ok {
 				if c.SourceOnly {
-					slog.Error("destination use is not allowed by config", "destination", destDSN)
-					os.Exit(1)
+					fatalSetup("destination use is not allowed by config", "destination", destDSN)
 				}
 
 				if c.Params == nil {
@@ -354,8 +517,7 @@ func main() {
 					if _, err := os.Stat(oldName); err == nil {
 						slog.Info("removing old directory", "directory", oldName)
 						if err := os.RemoveAll(oldName); err != nil {
-							slog.Error("failed to remove old directory", "error", err, "directory", oldName)
-							os.Exit(1)
+							fatalSetup("failed to remove old directory", "error", err, "directory", oldName)
 						}
 					}
 
@@ -363,22 +525,19 @@ func main() {
 					// so that we can rename our new directory to the correct name
 					slog.Info("moving directory", "from", finalName, "to", oldName)
 					if err := os.Rename(finalName, oldName); err != nil {
-						slog.Error("failed to rename directory", "error", err, "from", finalName, "to", oldName)
-						os.Exit(1)
+						fatalSetup("failed to rename directory", "error", err, "from", finalName, "to", oldName)
 					}
 
 					// and then we can rename our new directory to the correct name
 					slog.Info("moving directory", "from", name, "to", finalName)
 					if err := os.Rename(name, finalName); err != nil {
-						slog.Error("failed to rename directory", "error", err, "from", name, "to", finalName)
-						os.Exit(1)
+						fatalSetup("failed to rename directory", "error", err, "from", name, "to", finalName)
 					}
 
 					// and then we can remove the old directory
 					slog.Info("removing old directory", "directory", oldName)
 					if err := os.RemoveAll(oldName); err != nil {
-						slog.Error("failed to remove old directory", "error", err, "directory", oldName)
-						os.Exit(1)
+						fatalSetup("failed to remove old directory", "error", err, "directory", oldName)
 					}
 				}()
 			}
@@ -387,8 +546,7 @@ func main() {
 
 			db, err = mysql.NewLocalWriter(name)
 			if err != nil {
-				slog.Error("failed to create local writer", "error", err, "name", name)
-				os.Exit(1)
+				fatalSetup("failed to create local writer", "error", err, "name", name)
 			}
 		} else if destIsClipboard {
 			clipboardBuf = new(bytes.Buffer)
@@ -396,8 +554,7 @@ func main() {
 
 			db, err = mysql.NewWriter(clipboardBuf)
 			if err != nil {
-				slog.Error("failed to create writer", "error", err)
-				os.Exit(1)
+				fatalSetup("failed to create writer", "error", err)
 			}
 		} else {
 			// Anchor every dest pool conn to UTC, matching the source. Without
@@ -406,13 +563,11 @@ func main() {
 			// the 32-bit seconds range and 1067'ing on CREATE.
 			destDSN, err = ensureUTCSession(destDSN)
 			if err != nil {
-				slog.Error("failed to apply UTC session tz to destination DSN", "error", err, "destinationDSN", friendlyName)
-				os.Exit(1)
+				fatalSetup("failed to apply UTC session tz to destination DSN", "error", err, "destinationDSN", friendlyName)
 			}
 			db, err = mysql.NewFromDSN(destDSN, destDSN)
 			if err != nil {
-				slog.Error("failed to create destination connection", "error", err, "destinationDSN", destDSN)
-				os.Exit(1)
+				fatalSetup("failed to create destination connection", "error", err, "destinationDSN", destDSN)
 			}
 		}
 
@@ -434,14 +589,10 @@ func main() {
 		dsts = append(dsts, destInfo{db, destIsPath, destIsClipboard, clipboardBuf})
 	}
 
-	if len(dsts) > 1 {
-		slog.Info("importing to multiple destinations", "count", len(dsts))
-	}
-
+	setupStatus("resolving tables...")
 	tableNames, err := getTables(*aliasesFiles, *all, args, src)
 	if err != nil {
-		slog.Error("failed to get tables", "error", err, "aliasesFile", *aliasesFiles, "all", *all, "args", *args)
-		os.Exit(1)
+		fatalSetup("failed to get tables", "error", err, "aliasesFile", *aliasesFiles, "all", *all, "args", *args)
 	}
 
 	// get our tables ordered by the largest physical tables first
@@ -451,6 +602,7 @@ func main() {
 	// we collect into a slice so it can be reused across multiple destinations
 	var orderedTables []string
 	if len(*tableNames) > 0 {
+		setupStatus(fmt.Sprintf("ordering %d tables by size...", len(*tableNames)))
 		tablesCh := make(chan string, len(*tableNames))
 		go func() {
 			defer close(tablesCh)
@@ -463,8 +615,7 @@ func main() {
 				"Tables": *tableNames,
 			})
 			if err != nil {
-				slog.Error("failed to select tables", "error", err)
-				os.Exit(1)
+				fatalSetup("failed to select tables", "error", err)
 			}
 		}()
 		for t := range tablesCh {
@@ -472,18 +623,23 @@ func main() {
 		}
 	}
 
-	// our multi-progress bar ties right into our wait group
-	var wg sync.WaitGroup
-	var p *mpb.Progress
-	if !*noProgressBars {
-		p = mpb.New(mpb.WithWaitGroup(&wg))
+	u.SetTables(orderedTables)
+
+	// TUI mode replays the run header post-dismiss; non-TUI prints it now.
+	if !useTUI {
+		printRunHeader(sourceFriendly, destFriendlyNames, orderedTables)
 	}
 
-	// we need to delay some funcs, most notably the foreign key constraint part.
-	// problem comes from us importing two tables that depend on each other; when
-	// one finishes before the other, if we create the constraints as well, then it will fail
-	// because the other table doesn't exist yet.
-	delayedFuncs := make(chan func(), len(orderedTables))
+	var wg sync.WaitGroup
+
+	slog.Info("swoof run started",
+		"source", sourceFriendly,
+		"destinations", destFriendlyNames,
+		"tables", len(orderedTables),
+		"threads", *threads)
+
+	// FK constraints applied post-import so cross-references resolve.
+	delayedFuncs := make(chan func() error, len(orderedTables))
 
 	tableCount := 0
 	for _, table := range orderedTables {
@@ -494,55 +650,20 @@ func main() {
 		// And IMO this is cleaner than having the func below accept the string
 		tableName := table
 
-		// ensure we only run up to our max imports at a time
-		guard <- struct{}{}
-
 		wg.Add(1)
 
-		var bar *mpb.Bar
-		if !*noProgressBars {
-			// Tracked locally so the rate closure can feed its value through
-			// formatShort; also means retry's bar.SetCurrent(0) keeps the
-			// displayed rate honest.
-			tableStart := time.Now()
-			var finalElapsed time.Duration
-			bar = p.New(0,
-				mpb.BarStyle(),
-				mpb.PrependDecorators(
-					decor.Name(color.HiBlueString(tableName)),
-					decor.OnComplete(decor.Percentage(decor.WC{W: 5}), color.HiMagentaString(" done!")),
-				),
-				mpb.AppendDecorators(
-					decor.Any(func(s decor.Statistics) string {
-						return "( " + color.HiCyanString(formatShort(s.Current)+"/"+formatShort(s.Total)) + ", "
-					}),
-					decor.Any(func(s decor.Statistics) string {
-						// Freeze the elapsed value on completion so the displayed
-						// rate stops drifting downward as the decorator keeps firing.
-						var elapsed time.Duration
-						if s.Completed {
-							if finalElapsed == 0 {
-								finalElapsed = time.Since(tableStart)
-							}
-							elapsed = finalElapsed
-						} else {
-							elapsed = time.Since(tableStart)
-						}
-						var rate int64
-						if elapsed > 0 {
-							rate = int64(float64(s.Current) / elapsed.Seconds())
-						}
-						return " " + color.HiGreenString(formatShort(rate)+"/s") + " ) "
-					}),
-					decor.AverageETA(decor.ET_STYLE_GO),
-					decor.Name(" | "),
-					decor.Elapsed(decor.ET_STYLE_GO, decor.WC{C: decor.DindentRight}),
-				),
-			)
+		var state *tableState
+		if u != nil {
+			state = u.State(tableName)
 		}
 
 		go func() {
 			defer wg.Done()
+
+			// Throttle after the bar is registered so progress rendering
+			// reflects all tables from the start; the semaphore just paces
+			// how many goroutines actually do work concurrently.
+			guard <- struct{}{}
 			defer func() { <-guard }()
 
 			// compute the per-table destination, applying WriterWithSubdir for file dests
@@ -555,6 +676,7 @@ func main() {
 			}
 
 			tempTableName := *tempTablePrefix + tableName
+			tableStart := time.Now()
 
 			// Safe to retry because the real table is only swapped in by the
 			// delayed finalization pass, which runs after the attempt succeeds.
@@ -563,10 +685,9 @@ func main() {
 					slog.Warn("retrying table import",
 						"tableName", tableName,
 						"attempt", attempt)
-					if bar != nil {
-						bar.SetCurrent(0)
-					}
+					state.Reset()
 				}
+				state.Begin(attempt)
 
 				// Fresh *sql.DB pool per attempt so NewFromDSN / Ping failures
 				// also go through the retry loop, and each table goroutine's
@@ -716,7 +837,7 @@ func main() {
 				g, ctx := errgroup.WithContext(context.Background())
 
 				var count int64
-				if !*skipData && !*noProgressBars && !*skipCount {
+				if !*skipData && !*skipCount {
 					countQ := "select count(*)`Count`from`" + tableName + "`"
 					if *whereClause != "" {
 						countQ += " where " + *whereClause + " "
@@ -724,7 +845,7 @@ func main() {
 					if err := srcTable.SelectContext(ctx, &count, countQ, 0); err != nil {
 						return struct{}{}, errors.Wrapf(err, "count rows for %q", tableName)
 					}
-					bar.SetTotal(count, false)
+					state.SetTotal(count)
 				}
 
 				// Build the finalization closure during the attempt but do NOT push it
@@ -758,7 +879,7 @@ func main() {
 					createSuffix := strings.TrimPrefix(tableInfo.CreateMySQL, "CREATE TABLE `"+tableName+"`")
 
 					for _, dst := range tableDsts {
-						if !*dryRyn {
+						if !*dryRun {
 							if err := dst.Exec("drop table if exists`" + tempTableName + "`"); err != nil {
 								return struct{}{}, errors.Wrapf(err, "drop temp table %q", tempTableName)
 							}
@@ -771,20 +892,19 @@ func main() {
 					onSuccess = func() {
 						// Queued to run after all tables finish importing. Renames the temp
 						// table over the real one, re-adds constraints, and copies triggers.
-						delayedFuncs <- func() {
-							if !*dryRyn {
+						delayedFuncs <- func() error {
+							finalizeStart := time.Now()
+							if !*dryRun {
 								for _, dst := range tableDsts {
 									if err := dst.Exec("drop table if exists`" + tableName + "`"); err != nil {
-										slog.Error("failed to drop table", "error", err, "tableName", tempTableName)
-										os.Exit(1)
+										return errors.Wrapf(err, "drop table %q", tempTableName)
 									}
 
 									// Non-atomic rename on purpose — atomic would also rename
 									// other tables' FK references to point at the old name.
 									// Small downtime on live dest is the accepted tradeoff.
 									if err := dst.Exec("alter table`" + tempTableName + "`rename`" + tableName + "`"); err != nil {
-										slog.Error("failed to rename table", "error", err, "from", tempTableName, "to", tableName)
-										os.Exit(1)
+										return errors.Wrapf(err, "rename table %q to %q", tempTableName, tableName)
 									}
 
 									if len(constraints) != 0 {
@@ -800,11 +920,11 @@ func main() {
 							triggers := make(chan struct {
 								Trigger string
 							})
+							var triggerSelectErr error
 							go func() {
 								defer close(triggers)
 								if err := src.Select(triggers, "show triggers where`table`='"+tableName+"'", 0); err != nil {
-									slog.Error("failed to select triggers", "error", err, "tableName", tableName)
-									os.Exit(1)
+									triggerSelectErr = err
 								}
 							}()
 							for r := range triggers {
@@ -812,31 +932,41 @@ func main() {
 									CreateMySQL string `mysql:"SQL Original Statement"`
 								}
 								if err := src.Select(&trigger, "show create trigger`"+r.Trigger+"`", 0); err != nil {
-									slog.Error("failed to select trigger creation syntax", "error", err, "trigger", r.Trigger, "tableName", tableName)
-									os.Exit(1)
+									return errors.Wrapf(err, "select trigger creation syntax for %q on table %q", r.Trigger, tableName)
 								}
 
 								// Strip DEFINER — the definer user may not exist on dest.
 								trigger.CreateMySQL = definerRegexp.ReplaceAllString(trigger.CreateMySQL, "")
 
-								if !*dryRyn {
+								if !*dryRun {
 									for _, dst := range tableDsts {
 										if err := dst.Exec(trigger.CreateMySQL); err != nil {
-											slog.Error("failed to execute trigger creation SQL", "error", err, "trigger", r.Trigger, "tableName", tableName)
-											os.Exit(1)
+											return errors.Wrapf(err, "execute trigger creation SQL for %q on table %q", r.Trigger, tableName)
 										}
 									}
 								}
 							}
+							if triggerSelectErr != nil {
+								return errors.Wrapf(triggerSelectErr, "select triggers for table %q", tableName)
+							}
+							state.Finalize()
+							slog.Info("finalized table",
+								"tableName", tableName,
+								"duration", time.Since(finalizeStart).Round(time.Millisecond))
+							return nil
 						}
 					}
 				}
 
-				if *noProgressBars && attempt == 1 {
-					slog.Info("importing table", "tableName", tableName)
+				if attempt == 1 {
+					if count > 0 {
+						slog.Info("starting table", "tableName", tableName, "rows", count)
+					} else {
+						slog.Info("starting table", "tableName", tableName)
+					}
 				}
 
-				if !*skipData && !*dryRyn {
+				if !*skipData && !*dryRun {
 					insertPrefix := "insert into`" + tempTableName + "`"
 					if *insertIgnoreInto {
 						insertPrefix = "insert ignore into`" + tableName + "`"
@@ -865,9 +995,9 @@ func main() {
 						// Single destination: consume source channel directly.
 						g.Go(func() error {
 							inserter := tableDsts[0].I()
-							if !*noProgressBars {
+							if state != nil {
 								inserter = inserter.SetAfterRowExec(func(_ time.Time) {
-									bar.Increment()
+									state.Increment()
 								})
 							}
 							if err := inserter.InsertContext(ctx, insertPrefix, srcChRef.Interface()); err != nil {
@@ -928,9 +1058,9 @@ func main() {
 							g.Go(func() error {
 								inserter := tableDsts[j].I()
 								// Track progress from the first destination only.
-								if j == 0 && !*noProgressBars {
+								if j == 0 && state != nil {
 									inserter = inserter.SetAfterRowExec(func(_ time.Time) {
-										bar.Increment()
+										state.Increment()
 									})
 								}
 								if err := inserter.InsertContext(ctx, insertPrefix, dstChRefs[j].Interface()); err != nil {
@@ -978,12 +1108,15 @@ func main() {
 				if !isTransientError(err) {
 					return v, backoff.Permanent(err)
 				}
+				short := rootErrorMsg(err)
 				slog.Warn("transient table import error, will retry",
 					"tableName", tableName,
 					"attempt", attempts,
+					"cause", short,
 					"error", err,
 					"chain", formatErrorChain(err),
 					"stack", extractErrorStack(err))
+				state.Retrying(short)
 				return v, err
 			}
 
@@ -1006,206 +1139,299 @@ func main() {
 					"stack", extractErrorStack(inner),
 					"tableName", tableName,
 					"attempts", attempts)
+				state.Fail(rootErrorMsg(inner))
+				if u != nil {
+					u.Fatal(fmt.Errorf("table %q import failed after %d attempts: %w", tableName, attempts, inner))
+					return
+				}
 				os.Exit(1)
 			}
 
-			if !*noProgressBars {
-				// In case row count drifted between the count query and the stream.
-				bar.SetTotal(bar.Current(), true)
+			elapsed := time.Since(tableStart).Round(time.Second)
+			if attempts > 1 {
+				slog.Info("recovered after retries",
+					"tableName", tableName,
+					"attempts", attempts,
+					"duration", elapsed)
+			}
+			slog.Info("finished table",
+				"tableName", tableName,
+				"rows", state.Rows(),
+				"duration", elapsed)
+
+			state.Complete()
+			// -insert-ignore has no delayed swap, so finalize TUI state now.
+			if *insertIgnoreInto {
+				state.Finalize()
 			}
 		}()
 	}
 
-	if !*noProgressBars {
-		p.Wait()
-	} else {
+	workersDone := make(chan struct{})
+	go func() {
 		wg.Wait()
-	}
+		close(workersDone)
+	}()
 
-	if !*insertIgnoreInto {
-		close(delayedFuncs)
-
-		slog.Info("finalizing table imports...")
-
-		for f := range delayedFuncs {
-			f()
-		}
-	}
-
-	// funcs, views, and procs are read from source once and applied to all dests
-	if *funcs {
-		slog.Info("importing functions...")
-
-		funcDsts := make([]*mysql.Database, len(dsts))
-		for i, d := range dsts {
-			funcDsts[i] = d.db
-			if d.isPath {
-				funcDsts[i] = d.db.WriterWithSubdir("funcs")
+	if u != nil {
+		// If the TUI exits before workers finish, either the user interrupted
+		// (Ctrl+C / q -> errInterrupted) or a worker hit a permanent failure
+		// and called u.Fatal. We can't gracefully cancel the in-flight workers
+		// (no shared ctx), so force-exit either way; differentiate the message
+		// and exit code based on the recorded firstErr.
+		select {
+		case <-workersDone:
+		case <-u.Done():
+			log.SetOutput(os.Stderr)
+			fatalErr := u.FirstError()
+			path := u.LogPath()
+			if stderrors.Is(fatalErr, errInterrupted) {
+				fmt.Fprintln(os.Stderr, "\nswoof: interrupted")
+				if path != "" {
+					fmt.Fprintf(os.Stderr, "log: %s\n", path)
+				}
+				os.Exit(130)
 			}
-		}
-
-		var funcs []struct {
-			FuncName string `mysql:"ROUTINE_NAME"`
-		}
-		err = src.Select(&funcs, "select`ROUTINE_NAME`"+
-			"from`information_schema`.`ROUTINES`"+
-			"where`ROUTINE_SCHEMA`=database()"+
-			"and`ROUTINE_TYPE`='FUNCTION'", 0)
-		if err != nil {
-			slog.Error("failed to select functions", "error", err)
+			if fatalErr != nil {
+				fmt.Fprintf(os.Stderr, "\nswoof: %v\n", fatalErr)
+			}
+			if path != "" {
+				fmt.Fprintf(os.Stderr, "full log: %s\n", path)
+			}
 			os.Exit(1)
 		}
 
-		for _, f := range funcs {
-			var funcInfo struct {
-				CreateMySQL string `mysql:"Create Function"`
+		if fatalErr := u.FirstError(); fatalErr != nil {
+			u.Stop()
+			log.SetOutput(os.Stderr)
+			fmt.Fprintf(os.Stderr, "\nswoof: %v\n", fatalErr)
+			if path := u.LogPath(); path != "" {
+				fmt.Fprintf(os.Stderr, "full log: %s\n", path)
 			}
-			err = src.Select(&funcInfo, "show create function`"+f.FuncName+"`", 0)
-			if err != nil {
-				slog.Error("failed to select function creation syntax", "error", err, "functionName", f.FuncName)
-				os.Exit(1)
+			os.Exit(1)
+		}
+
+		slog.Info("table imports complete",
+			"tables", tableCount,
+			"duration", time.Since(start).Round(time.Second))
+	} else {
+		<-workersDone
+	}
+
+	// Finalize keeps the TUI alive so swap progress shows in the log pane.
+	finalizeErr := func() error {
+		if !*insertIgnoreInto {
+			close(delayedFuncs)
+
+			slog.Info("finalizing table imports...")
+
+			for f := range delayedFuncs {
+				if err := f(); err != nil {
+					return err
+				}
+			}
+		}
+
+		// funcs, views, and procs are read from source once and applied to all dests
+		if *funcs {
+			slog.Info("importing functions...")
+
+			funcDsts := make([]*mysql.Database, len(dsts))
+			for i, d := range dsts {
+				funcDsts[i] = d.db
+				if d.isPath {
+					funcDsts[i] = d.db.WriterWithSubdir("funcs")
+				}
 			}
 
-			funcInfo.CreateMySQL = definerRegexp.ReplaceAllString(funcInfo.CreateMySQL, "")
+			var srcFuncs []struct {
+				FuncName string `mysql:"ROUTINE_NAME"`
+			}
+			if err := src.Select(&srcFuncs, "select`ROUTINE_NAME`"+
+				"from`information_schema`.`ROUTINES`"+
+				"where`ROUTINE_SCHEMA`=database()"+
+				"and`ROUTINE_TYPE`='FUNCTION'", 0); err != nil {
+				return errors.Wrap(err, "select functions")
+			}
 
-			if !*dryRyn {
-				for _, dst := range funcDsts {
-					err = dst.Exec("drop function if exists`" + f.FuncName + "`")
-					if err != nil {
-						slog.Error("failed to drop function", "error", err, "functionName", f.FuncName)
-						os.Exit(1)
-					}
+			for _, f := range srcFuncs {
+				var funcInfo struct {
+					CreateMySQL string `mysql:"Create Function"`
+				}
+				if err := src.Select(&funcInfo, "show create function`"+f.FuncName+"`", 0); err != nil {
+					return errors.Wrapf(err, "select function creation syntax for %q", f.FuncName)
+				}
 
-					err = dst.Exec(funcInfo.CreateMySQL)
-					if err != nil {
-						slog.Error("failed to execute function creation SQL", "error", err, "functionName", f.FuncName)
-						os.Exit(1)
+				funcInfo.CreateMySQL = definerRegexp.ReplaceAllString(funcInfo.CreateMySQL, "")
+
+				if !*dryRun {
+					for _, dst := range funcDsts {
+						if err := dst.Exec("drop function if exists`" + f.FuncName + "`"); err != nil {
+							return errors.Wrapf(err, "drop function %q", f.FuncName)
+						}
+						if err := dst.Exec(funcInfo.CreateMySQL); err != nil {
+							return errors.Wrapf(err, "create function %q", f.FuncName)
+						}
 					}
 				}
 			}
 		}
-	}
 
-	if *views {
-		slog.Info("importing views...")
+		if *views {
+			slog.Info("importing views...")
 
-		viewDsts := make([]*mysql.Database, len(dsts))
-		for i, d := range dsts {
-			viewDsts[i] = d.db
-			if d.isPath {
-				viewDsts[i] = d.db.WriterWithSubdir("views")
-			}
-		}
-
-		var views []struct {
-			ViewName string `mysql:"TABLE_NAME"`
-		}
-		err = src.Select(&views, "select`TABLE_NAME`"+
-			"from`information_schema`.`TABLES`"+
-			"where`TABLE_SCHEMA`=database()"+
-			"and`TABLE_TYPE`='VIEW'", 0)
-		if err != nil {
-			slog.Error("failed to select views", "error", err)
-			os.Exit(1)
-		}
-
-		for _, v := range views {
-			var view struct {
-				CreateMySQL string `mysql:"Create View"`
-			}
-			err = src.Select(&view, "show create view`"+v.ViewName+"`", 0)
-			if err != nil {
-				slog.Error("failed to select view creation syntax", "error", err, "viewName", v.ViewName)
-				os.Exit(1)
+			viewDsts := make([]*mysql.Database, len(dsts))
+			for i, d := range dsts {
+				viewDsts[i] = d.db
+				if d.isPath {
+					viewDsts[i] = d.db.WriterWithSubdir("views")
+				}
 			}
 
-			view.CreateMySQL = definerRegexp.ReplaceAllString(view.CreateMySQL, "")
+			var srcViews []struct {
+				ViewName string `mysql:"TABLE_NAME"`
+			}
+			if err := src.Select(&srcViews, "select`TABLE_NAME`"+
+				"from`information_schema`.`TABLES`"+
+				"where`TABLE_SCHEMA`=database()"+
+				"and`TABLE_TYPE`='VIEW'", 0); err != nil {
+				return errors.Wrap(err, "select views")
+			}
 
-			if !*dryRyn {
-				for _, dst := range viewDsts {
-					err = dst.Exec("drop view if exists`" + v.ViewName + "`")
-					if err != nil {
-						slog.Error("failed to drop view", "error", err, "viewName", v.ViewName)
-						os.Exit(1)
-					}
+			for _, v := range srcViews {
+				var view struct {
+					CreateMySQL string `mysql:"Create View"`
+				}
+				if err := src.Select(&view, "show create view`"+v.ViewName+"`", 0); err != nil {
+					return errors.Wrapf(err, "select view creation syntax for %q", v.ViewName)
+				}
 
-					err = dst.Exec(view.CreateMySQL)
-					if err != nil {
-						slog.Error("failed to execute view creation SQL", "error", err, "viewName", v.ViewName)
-						os.Exit(1)
+				view.CreateMySQL = definerRegexp.ReplaceAllString(view.CreateMySQL, "")
+
+				if !*dryRun {
+					for _, dst := range viewDsts {
+						if err := dst.Exec("drop view if exists`" + v.ViewName + "`"); err != nil {
+							return errors.Wrapf(err, "drop view %q", v.ViewName)
+						}
+						if err := dst.Exec(view.CreateMySQL); err != nil {
+							return errors.Wrapf(err, "create view %q", v.ViewName)
+						}
 					}
 				}
 			}
 		}
-	}
 
-	if *procs {
-		slog.Info("importing stored procedures...")
+		if *procs {
+			slog.Info("importing stored procedures...")
 
-		procDsts := make([]*mysql.Database, len(dsts))
-		for i, d := range dsts {
-			procDsts[i] = d.db
-			if d.isPath {
-				procDsts[i] = d.db.WriterWithSubdir("procs")
-			}
-		}
-
-		var procs []struct {
-			ProcName string `mysql:"ROUTINE_NAME"`
-		}
-		err = src.Select(&procs, "select`ROUTINE_NAME`"+
-			"from`information_schema`.`ROUTINES`"+
-			"where`ROUTINE_SCHEMA`=database()"+
-			"and`ROUTINE_TYPE`='PROCEDURE'", 0)
-		if err != nil {
-			slog.Error("failed to select stored procedures", "error", err)
-			os.Exit(1)
-		}
-
-		for _, p := range procs {
-			var procInfo struct {
-				CreateMySQL string `mysql:"Create Procedure"`
-			}
-			err = src.Select(&procInfo, "show create procedure`"+p.ProcName+"`", 0)
-			if err != nil {
-				slog.Error("failed to select stored procedure creation syntax", "error", err, "procedureName", p.ProcName)
-				os.Exit(1)
+			procDsts := make([]*mysql.Database, len(dsts))
+			for i, d := range dsts {
+				procDsts[i] = d.db
+				if d.isPath {
+					procDsts[i] = d.db.WriterWithSubdir("procs")
+				}
 			}
 
-			procInfo.CreateMySQL = definerRegexp.ReplaceAllString(procInfo.CreateMySQL, "")
+			var srcProcs []struct {
+				ProcName string `mysql:"ROUTINE_NAME"`
+			}
+			if err := src.Select(&srcProcs, "select`ROUTINE_NAME`"+
+				"from`information_schema`.`ROUTINES`"+
+				"where`ROUTINE_SCHEMA`=database()"+
+				"and`ROUTINE_TYPE`='PROCEDURE'", 0); err != nil {
+				return errors.Wrap(err, "select stored procedures")
+			}
 
-			if !*dryRyn {
-				for _, dst := range procDsts {
-					err = dst.Exec("drop procedure if exists`" + p.ProcName + "`")
-					if err != nil {
-						slog.Error("failed to drop procedure", "error", err, "procedureName", p.ProcName)
-						os.Exit(1)
-					}
+			for _, p := range srcProcs {
+				var procInfo struct {
+					CreateMySQL string `mysql:"Create Procedure"`
+				}
+				if err := src.Select(&procInfo, "show create procedure`"+p.ProcName+"`", 0); err != nil {
+					return errors.Wrapf(err, "select stored procedure creation syntax for %q", p.ProcName)
+				}
 
-					err = dst.Exec(procInfo.CreateMySQL)
-					if err != nil {
-						slog.Error("failed to execute stored procedure creation SQL", "error", err, "procedureName", p.ProcName)
-						os.Exit(1)
+				procInfo.CreateMySQL = definerRegexp.ReplaceAllString(procInfo.CreateMySQL, "")
+
+				if !*dryRun {
+					for _, dst := range procDsts {
+						if err := dst.Exec("drop procedure if exists`" + p.ProcName + "`"); err != nil {
+							return errors.Wrapf(err, "drop stored procedure %q", p.ProcName)
+						}
+						if err := dst.Exec(procInfo.CreateMySQL); err != nil {
+							return errors.Wrapf(err, "create stored procedure %q", p.ProcName)
+						}
 					}
 				}
 			}
 		}
+
+		for _, d := range dsts {
+			if d.isClipboard {
+				d.clipboard.WriteString("set foreign_key_checks=1;\n")
+
+				if err := clipboard.Init(); err != nil {
+					return errors.Wrap(err, "initialize clipboard")
+				}
+
+				clipboard.Write(clipboard.FmtText, d.clipboard.Bytes())
+
+				slog.Info("copied to clipboard", "size", len(d.clipboard.Bytes()))
+			}
+		}
+
+		return nil
+	}()
+
+	if finalizeErr != nil {
+		if u != nil {
+			u.Fatal(finalizeErr)
+			<-u.Done()
+			log.SetOutput(os.Stderr)
+			fmt.Fprintf(os.Stderr, "\nswoof: %v\n", finalizeErr)
+			if path := u.LogPath(); path != "" {
+				fmt.Fprintf(os.Stderr, "full log: %s\n", path)
+			}
+		} else {
+			slog.Error("finalization failed", "error", finalizeErr)
+		}
+		os.Exit(1)
 	}
 
-	for _, d := range dsts {
-		if d.isClipboard {
-			d.clipboard.WriteString("set foreign_key_checks=1;\n")
-
-			if err := clipboard.Init(); err != nil {
-				slog.Error("failed to initialize clipboard", "error", err)
-				os.Exit(1)
-			}
-
-			clipboard.Write(clipboard.FmtText, d.clipboard.Bytes())
-
-			slog.Info("copied to clipboard", "size", len(d.clipboard.Bytes()))
+	// Ctrl+C / q during finalize: skip the success banner. Can't abort
+	// finalize itself — partial swap would leave dest in a worse state.
+	if u != nil && stderrors.Is(u.FirstError(), errInterrupted) {
+		log.SetOutput(os.Stderr)
+		fmt.Fprintln(os.Stderr, "\nswoof: interrupted")
+		if path := u.LogPath(); path != "" {
+			fmt.Fprintf(os.Stderr, "log: %s\n", path)
 		}
+		os.Exit(130)
 	}
 
 	slog.Info("finished importing tables", "count", tableCount, "destinations", len(dsts), "duration", time.Since(start))
+
+	notifyDesktop("swoof", fmt.Sprintf("Swoofed %d tables in %s",
+		tableCount, time.Since(start).Round(time.Second)))
+
+	if u != nil {
+		u.MarkCompleted()
+		<-u.Done()
+		log.SetOutput(os.Stderr)
+
+		// Replay setup + run summary into scrollback now that alt-screen is gone.
+		fmt.Fprintln(os.Stderr)
+		for _, msg := range setupStatuses {
+			printSetupStatus(msg)
+		}
+		fmt.Fprintln(os.Stderr)
+		if len(orderedTables) > 0 {
+			printTableColumns(orderedTables)
+			fmt.Fprintln(os.Stderr)
+		}
+		printRunSummaryLabels(sourceFriendly, destFriendlyNames, orderedTables)
+		fmt.Fprintln(os.Stderr)
+		if path := u.LogPath(); path != "" {
+			fmt.Fprintf(os.Stderr, "log: %s\n", path)
+		}
+	}
 }
