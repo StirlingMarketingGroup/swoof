@@ -16,7 +16,7 @@ require (
 	golang.design/x/clipboard v0.8.0
 	golang.org/x/mod v0.38.0
 	golang.org/x/sync v0.21.0
-	golang.org/x/term v0.44.0
+	golang.org/x/term v0.45.0
 	gopkg.in/yaml.v2 v2.4.0
 )
 
@@ -58,6 +58,6 @@ require (
 	golang.org/x/exp v0.0.0-20190731235908-ec7cb31e5a56 // indirect
 	golang.org/x/image v0.41.0 // indirect
 	golang.org/x/mobile v0.0.0-20250606033058-a2a15c67f36f // indirect
-	golang.org/x/sys v0.46.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 )
