@@ -14,7 +14,7 @@ require (
 	github.com/posener/cmd v1.3.4
 	github.com/rivo/tview v0.42.0
 	golang.design/x/clipboard v0.8.0
-	golang.org/x/mod v0.37.0
+	golang.org/x/mod v0.38.0
 	golang.org/x/sync v0.21.0
 	golang.org/x/term v0.44.0
 	gopkg.in/yaml.v2 v2.4.0
