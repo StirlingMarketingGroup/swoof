@@ -72,6 +72,14 @@ var (
 
 	skipCount = root.Bool("skip-count", false, "skips the count query for each table, which can be slow for large tables")
 
+	refreshCompletions = root.Bool("refresh-completions", false, "refreshes the cached table lists used for shell completion for every source-capable named connection, then exits")
+
+	diffLong  = root.Bool("diff", false, "lists source tables, views, functions, and procedures missing from the destination, then exits")
+	diffShort = root.Bool("d", false, "alias for -diff")
+
+	missingLong  = root.Bool("missing", false, "selects only the objects missing from the destination (like -all, but filtered to what the destination lacks)")
+	missingShort = root.Bool("m", false, "alias for -missing")
+
 	// not entirely sure how much this really affects performance,
 	// since the performance bottleneck is almost guaranteed to be writing
 	// the rows to the source
@@ -272,6 +280,8 @@ func printTableColumns(tables []string) {
 // Best-effort: silently no-ops where beeep can't reach a notification
 // service (SSH-to-headless, CI, etc.).
 func notifyDesktop(title, message string) {
+	// Otherwise the notification daemon shows beeep's "DefaultAppName".
+	beeep.AppName = "swoof"
 	_ = beeep.Notify(title, message, "")
 }
 
@@ -295,11 +305,22 @@ func ensureSemverPrefix(v string) string {
 }
 
 func main() {
+	// Reserved subcommands (completion helpers, init, man) run before the
+	// normal flag parser and without the startup banner.
+	if dispatchSubcommand() {
+		return
+	}
+
 	start := time.Now()
 
 	// parse our command line arguments and make sure we
 	// were given something that makes sense
 	root.ParseArgs(os.Args...)
+
+	if *refreshCompletions {
+		refreshAllConnections(*connectionsFile, refreshTimeout)
+		os.Exit(0)
+	}
 
 	if *showVersion {
 		_, current := moduleVersion()
@@ -318,16 +339,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	diffMode := *diffLong || *diffShort
+	missingMode := *missingLong || *missingShort
+
 	if *skipData {
 		*noProgressBars = true
 	}
 
 	// The TUI is the primary rendering path. It's disabled when the user
 	// explicitly asks for plain output (-no-progress), when -verbose is set
-	// (every query would flood the log pane), or when stdout is not a TTY
-	// (piping / redirection). In the non-TUI path we also skip the COUNT(*)
-	// per table since there's no bar to feed it into.
-	useTUI := !*noProgressBars && !*verbose && term.IsTerminal(int(os.Stdout.Fd()))
+	// (every query would flood the log pane), when stdout is not a TTY
+	// (piping / redirection), or in the report-only -diff mode.
+	useTUI := !*noProgressBars && !*verbose && !diffMode && term.IsTerminal(int(os.Stdout.Fd()))
 	if !useTUI {
 		*skipCount = true
 	}
@@ -423,6 +446,12 @@ func main() {
 	}
 
 	src.DisableUnusedColumnWarnings = true
+
+	// Opportunistically refresh the completion table cache for named source
+	// connections, so shell completion stays warm from real usage at no cost.
+	if _, ok := connections[sourceFriendly]; ok {
+		warmTableCacheAsync(src, sourceFriendly)
+	}
 
 	if *verbose {
 		src.Log = func(detail mysql.LogDetail) {
@@ -589,10 +618,32 @@ func main() {
 		dsts = append(dsts, destInfo{db, destIsPath, destIsClipboard, clipboardBuf})
 	}
 
-	setupStatus("resolving tables...")
-	tableNames, err := getTables(*aliasesFiles, *all, args, src)
-	if err != nil {
-		fatalSetup("failed to get tables", "error", err, "aliasesFile", *aliasesFiles, "all", *all, "args", *args)
+	// -diff / -missing compare the source against a single database destination.
+	var missing *missingObjects
+	if diffMode || missingMode {
+		if len(dsts) != 1 || dsts[0].isPath || dsts[0].isClipboard {
+			fatalSetup("-diff and -missing require exactly one database destination")
+		}
+		setupStatus("comparing source and destination...")
+		missing, err = computeMissingObjects(src, dsts[0].db)
+		if err != nil {
+			fatalSetup("failed to compare source and destination", "error", err)
+		}
+		if diffMode {
+			printDiffReport(destFriendlyNames[0], missing)
+			os.Exit(0)
+		}
+	}
+
+	var tableNames *[]string
+	if missingMode {
+		tableNames = &missing.Tables
+	} else {
+		setupStatus("resolving tables...")
+		tableNames, err = getTables(*aliasesFiles, *all, args, src)
+		if err != nil {
+			fatalSetup("failed to get tables", "error", err, "aliasesFile", *aliasesFiles, "all", *all, "args", *args)
+		}
 	}
 
 	// get our tables ordered by the largest physical tables first
@@ -1254,6 +1305,17 @@ func main() {
 				return errors.Wrap(err, "select functions")
 			}
 
+			if missingMode {
+				keep := sliceToSet(missing.Funcs)
+				filtered := srcFuncs[:0]
+				for _, f := range srcFuncs {
+					if keep[f.FuncName] {
+						filtered = append(filtered, f)
+					}
+				}
+				srcFuncs = filtered
+			}
+
 			for _, f := range srcFuncs {
 				var funcInfo struct {
 					CreateMySQL string `mysql:"Create Function"`
@@ -1298,6 +1360,17 @@ func main() {
 				return errors.Wrap(err, "select views")
 			}
 
+			if missingMode {
+				keep := sliceToSet(missing.Views)
+				filtered := srcViews[:0]
+				for _, v := range srcViews {
+					if keep[v.ViewName] {
+						filtered = append(filtered, v)
+					}
+				}
+				srcViews = filtered
+			}
+
 			for _, v := range srcViews {
 				var view struct {
 					CreateMySQL string `mysql:"Create View"`
@@ -1340,6 +1413,17 @@ func main() {
 				"where`ROUTINE_SCHEMA`=database()"+
 				"and`ROUTINE_TYPE`='PROCEDURE'", 0); err != nil {
 				return errors.Wrap(err, "select stored procedures")
+			}
+
+			if missingMode {
+				keep := sliceToSet(missing.Procs)
+				filtered := srcProcs[:0]
+				for _, p := range srcProcs {
+					if keep[p.ProcName] {
+						filtered = append(filtered, p)
+					}
+				}
+				srcProcs = filtered
 			}
 
 			for _, p := range srcProcs {
@@ -1410,7 +1494,7 @@ func main() {
 
 	slog.Info("finished importing tables", "count", tableCount, "destinations", len(dsts), "duration", time.Since(start))
 
-	notifyDesktop("swoof", fmt.Sprintf("Swoofed %d tables in %s",
+	notifyDesktop("Swoof complete!", fmt.Sprintf("Swoofed %d tables in %s",
 		tableCount, time.Since(start).Round(time.Second)))
 
 	if u != nil {

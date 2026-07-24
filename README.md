@@ -34,6 +34,41 @@ export GOPATH=$HOME/go # if you don't already have a GOPATH set
 export PATH=$PATH:$GOPATH/bin
 ```
 
+After installing, run `swoof init` to set up the man pages and shell completions and to pre-warm the completion caches:
+
+```shell
+swoof init
+```
+
+`swoof init` installs system-wide when run as root, otherwise offers to use `sudo` and falls back to a per-user install. It detects your installed shells (bash, zsh, fish); pass `--shell bash,zsh` to limit them, `--user`/`--system` to force a scope, or `--no-cache` to skip cache pre-warming.
+
+### Shell completions
+
+Completions cover flags, connection names, alias names, and table names. Table names come from a per-connection cache (1h TTL) that is warmed automatically on every real run and by `swoof init`; refresh it manually anytime with:
+
+```shell
+swoof -refresh-completions
+```
+
+You can also print a completion script or man page directly (useful when installing by hand):
+
+```shell
+swoof completion zsh > ~/.zfunc/_swoof
+swoof man > swoof.1
+```
+
+### Prebuilt packages
+
+Each [release](https://github.com/StirlingMarketingGroup/swoof/releases) ships prebuilt binaries plus `.deb`, `.rpm`, and `.apk` packages for Linux. The packages install the binary along with the man pages (`man swoof`, `man 5 swoof`) and shell completions for bash, zsh, and fish — so you don't need `swoof init` when installing from a package.
+
+```shell
+# Debian/Ubuntu
+sudo dpkg -i swoof_*_linux_amd64.deb
+
+# Fedora/RHEL
+sudo rpm -i swoof_*_linux_amd64.rpm
+```
+
 ## Docker Alternative
 
 For those who use Docker for everything:
@@ -98,6 +133,8 @@ If you use `-w` with multiple tables, the same WHERE clause is applied to all of
 - `-c` your connections file (default `~/.config/swoof/connections.yaml` on Linux, more info below)
 - `-a` your alises file (default `~/.config/swoof/aliases.yaml` on Linux, more info below)
 - `-all` grabs all tables, specified tables/aliases are ignored (default false)
+- `-diff` / `-d` lists the tables, views, functions, and procedures that exist on the source but are missing from the destination, then exits without making changes (requires a single database destination)
+- `-missing` / `-m` selects only the objects missing from the destination — like `-all`, but filtered to what the destination lacks (tables always; funcs/views/procs when their flags are also set)
 - `-funcs` imports all functions after tables
 - `-views` imports all views after tables and functions
 - `-procs` imports all procedures after tables, functions, and views
