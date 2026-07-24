@@ -30,6 +30,39 @@ archives:
     format_overrides:
       - goos: windows
         formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - completions/*
+      - man/swoof.1
+      - man/swoof.5
+
+nfpms:
+  - vendor: Stirling Marketing Group
+    homepage: https://github.com/StirlingMarketingGroup/swoof
+    maintainer: Stirling Marketing Group <rmayers@smg.gg>
+    description: Move MySQL tables between databases using transactional swaps.
+    license: MIT
+    section: database
+    formats:
+      - deb
+      - rpm
+      - apk
+    contents:
+      - src: completions/swoof.bash
+        dst: /usr/share/bash-completion/completions/swoof
+      # zsh reads whichever of these is in fpath: site-functions is the
+      # Fedora/Homebrew convention, vendor-completions is Debian/Ubuntu's.
+      - src: completions/swoof.zsh
+        dst: /usr/share/zsh/site-functions/_swoof
+      - src: completions/swoof.zsh
+        dst: /usr/share/zsh/vendor-completions/_swoof
+      - src: completions/swoof.fish
+        dst: /usr/share/fish/vendor_completions.d/swoof.fish
+      - src: man/swoof.1
+        dst: /usr/share/man/man1/swoof.1
+      - src: man/swoof.5
+        dst: /usr/share/man/man5/swoof.5
 
 changelog:
   sort: asc

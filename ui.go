@@ -528,7 +528,9 @@ func centeredLine(termW int, staticColor string, parts ...any) string {
 		switch v := p.(type) {
 		case string:
 			plain.WriteString(v)
-			b.WriteString("[" + staticColor + "]")
+			b.WriteByte('[')
+			b.WriteString(staticColor)
+			b.WriteByte(']')
 			b.WriteString(v)
 			b.WriteString("[-:-:-]")
 		default:
