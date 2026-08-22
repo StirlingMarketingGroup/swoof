@@ -1,0 +1,101 @@
+.nh
+.TH swoof 5 "2026" swoof "File Formats"
+.SH NAME
+connections.yaml, aliases.yaml \- configuration files for swoof
+
+.SH DESCRIPTION
+\fBswoof\fP(1) reads two optional YAML configuration files. Both live in the
+per-user config directory resolved by Go's \fBos.UserConfigDir()\fR:
+\fB$XDG_CONFIG_HOME/swoof\fR (or \fB$HOME/.config/swoof\fR) on Linux,
+\fB$HOME/Library/Application Support/swoof\fR on macOS, and \fB%AppData%\\swoof\fR on
+Windows. Their locations can be overridden with the \fB-c\fR and \fB-a\fR flags
+respectively.
+
+.SH CONNECTIONS FILE
+\fBconnections.yaml\fR maps a short name to the details of a MySQL connection, so
+commands can refer to \fBproduction\fR instead of a full DSN. Each entry supports
+the following keys:
+.TP
+\fBuser\fR
+MySQL user name.
+
+.TP
+\fBpass\fR
+MySQL password.
+
+.TP
+\fBhost\fR
+Host, optionally with a port, e.g. \fBdb.example.com:3307\fR\&.
+
+.TP
+\fBschema\fR
+Default database (schema) to use.
+
+.TP
+\fBparams\fR
+A map of extra DSN parameters, passed through to the MySQL driver (for
+example \fBmaxAllowedPacket\fR).
+
+.TP
+\fBsource_only\fR
+If true, the connection may only be used as a \fIsource\fP\&. swoof refuses to use
+it as a destination, guarding against accidental writes to, e.g., production.
+
+.TP
+\fBdest_only\fR
+If true, the connection may only be used as a \fIdestination\fP\&.
+
+.PP
+Example:
+
+.EX
+production:
+  user: root
+  pass: super secret password
+  host: my-live.db:3307
+  schema: cooldb
+  source_only: true
+localhost:
+  user: root
+  pass: correct horse battery staple
+  host: 127.0.0.1
+  schema: cooldb
+  dest_only: true
+  params:
+    maxAllowedPacket: 1048576
+.EE
+
+.SH ALIASES FILE
+\fBaliases.yaml\fR maps a short name to a list of tables, so a group of tables can
+be referred to by one name. An alias entry may reference other aliases, which
+are resolved recursively until only table names remain.
+
+.PP
+When a table argument is given, swoof first checks whether it matches an alias
+key; if not, it is treated as a table name. Alias names must therefore not
+collide with real table names.
+
+.PP
+Example:
+
+.EX
+Products:
+  - products
+  - productlines
+Orders:
+  - orders
+  - orderdetails
+  - customers
+  - payments
+All:
+  - Products
+  - Orders
+.EE
+
+.SH SEE ALSO
+\fBswoof\fP(1)
+
+.PP
+MySQL DSN format:
+
+\[la]https://github.com/go\-sql\-driver/mysql#dsn\-data\-source\-name\[ra]

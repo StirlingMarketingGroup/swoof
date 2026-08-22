@@ -1,0 +1,265 @@
+.nh
+.TH swoof 1 "2026" swoof "User Commands"
+.SH NAME
+swoof \- move MySQL tables between databases using transactional swaps
+
+.SH SYNOPSIS
+\fBswoof\fR [\fIflags\fP] \fIsource\fP \fIdest\fP [\fItable\fP\&...]
+
+.PP
+\fBswoof init\fR [\fB--system\fR|\fB--user\fR] [\fB-y\fR] [\fB--shell\fR \fIlist\fP] [\fB--no-cache\fR]
+
+.PP
+\fBswoof completion\fR \fIbash\fP|\fIzsh\fP|\fIfish\fP
+
+.PP
+\fBswoof man\fR [\fIsection\fP]
+
+.SH DESCRIPTION
+\fBswoof\fP copies MySQL tables from a source database to one or more
+destination databases. Each table is imported into a temporary table and then
+atomically swapped into place with \fBRENAME TABLE\fR, so long imports do not take
+the destination table offline and a failed import never leaves a half-written
+table behind.
+
+.PP
+\fIsource\fP is a MySQL DSN (\fBuser:pass@(host)/dbname\fR) or a name defined in your
+connections file.
+
+.PP
+\fIdest\fP is one or more comma-separated destinations, each of which may be:
+.IP \(bu 2
+a DSN or a connection name (a live MySQL destination);
+.IP \(bu 2
+\fBclipboard\fR, which copies the generated SQL to the system clipboard
+instead of writing to a database;
+.IP \(bu 2
+\fBfile:\fR\fIpath\fP, which writes the generated SQL to a file (a local backup).
+
+.PP
+Table arguments may be literal table names, glob-style patterns, or aliases
+defined in your aliases file.
+
+.PP
+The connection and alias file formats are documented in \fBswoof\fP(5).
+
+.SH OPTIONS
+.TP
+\fB-a\fR \fIfile\fP
+Your aliases file (default \fB$XDG_CONFIG_HOME/swoof/aliases.yaml\fR).
+
+.TP
+\fB-c\fR \fIfile\fP
+Your connections file (default \fB$XDG_CONFIG_HOME/swoof/connections.yaml\fR).
+
+.TP
+\fB-all\fR
+Grab all tables; specified tables are ignored.
+
+.TP
+\fB-diff\fR, \fB-d\fR
+List the tables, views, functions, and stored procedures that exist on the
+source but are missing from the destination, then exit without making any
+changes. Requires exactly one database destination.
+
+.TP
+\fB-missing\fR, \fB-m\fR
+Select only the objects missing from the destination, like \fB-all\fR but
+filtered to what the destination lacks. Applies to tables, and — when the
+corresponding \fB-funcs\fR/\fB-views\fR/\fB-procs\fR flags are given — to functions,
+views, and procedures. Requires exactly one database destination.
+
+.TP
+\fB-n\fR
+Drop/create tables and triggers only, without importing data.
+
+.TP
+\fB-insert-ignore\fR
+Insert into the existing table without overwriting the existing rows.
+
+.TP
+\fB-funcs\fR
+Import all functions after tables.
+
+.TP
+\fB-views\fR
+Import all views after tables and functions.
+
+.TP
+\fB-procs\fR
+Import all stored procedures after tables, functions, and views.
+
+.TP
+\fB-t\fR \fIn\fP
+Max concurrent tables imported at the same time (default 4). Import
+stability may vary wildly between servers as this increases.
+
+.TP
+\fB-r\fR \fIn\fP
+Max rows buffer size; this many rows are downloaded and kept ready for
+importing (default 10000).
+
+.TP
+\fB-w\fR \fIclause\fP
+Optional WHERE clause used to filter rows from the source table, e.g.
+\fB-w "ID > 1000"\fR\&.
+
+.TP
+\fB-p\fR \fIprefix\fP
+Prefix of the temp table used for initial creation before the swap and drop
+(default \fB_swoof_\fR).
+
+.TP
+\fB-dry-run\fR
+Do not actually execute any queries that have an effect.
+
+.TP
+\fB-v\fR
+Write all queries to stdout.
+
+.TP
+\fB-no-progress\fR
+Disable the progress bars.
+
+.TP
+\fB-skip-count\fR
+Skip the per-table count query, which can be slow for very large tables.
+
+.TP
+\fB-refresh-completions\fR
+Refresh the cached table lists used for shell completion for every
+source-capable named connection, then exit.
+
+.TP
+\fB-version\fR
+Print the version and exit.
+
+.TP
+\fB-h\fR, \fB-help\fR
+Show help and exit.
+
+.SH COMMANDS
+.TP
+\fBinit\fR
+Install the man pages and shell completions and pre-warm the completion
+caches. Installs system-wide when run as root, otherwise offers to use
+\fBsudo\fP(8) and falls back to a per-user install. Detects the installed shells
+(bash, zsh, fish) and can be limited with \fB--shell\fR\&. \fB--no-cache\fR skips
+cache pre-warming; \fB-y\fR assumes yes for prompts.
+
+.TP
+\fBcompletion\fR \fIshell\fP
+Print the completion script for \fIshell\fP (\fBbash\fR, \fBzsh\fR, or \fBfish\fR) to
+standard output.
+
+.TP
+\fBman\fR [\fIsection\fP]
+Print the troff man page for the given \fIsection\fP (1 or 5; default 1) to
+standard output.
+
+.SH EXAMPLES
+Copy specific tables from one DSN to another:
+
+.EX
+swoof 'user:pass@(prod-host)/shop' 'user:pass@(localhost)/shop' products orders
+.EE
+
+.PP
+Use named connections from your connections file:
+
+.EX
+swoof production localhost products orders
+.EE
+
+.PP
+Fan out to multiple destinations:
+
+.EX
+swoof production localhost,staging products orders
+.EE
+
+.PP
+Copy every table matching a glob pattern:
+
+.EX
+swoof production localhost 'order_*'
+.EE
+
+.PP
+Only sync recent rows with a WHERE clause:
+
+.EX
+swoof -w "Created > '2025-01-01'" production localhost orders
+.EE
+
+.PP
+Dump a table to a local SQL file instead of a database:
+
+.EX
+swoof production file:backup.sql orders
+.EE
+
+.PP
+Set up completions, man pages, and warm the caches:
+
+.EX
+swoof init
+.EE
+
+.SH EXIT STATUS
+.TP
+\fB0\fR
+Success.
+
+.TP
+\fB1\fR
+An error occurred (bad flags, connection failure, failed import, etc.).
+
+.TP
+\fB130\fR
+Interrupted (SIGINT / Ctrl-C).
+
+.SH ENVIRONMENT
+.TP
+\fBXDG_CONFIG_HOME\fR, \fBHOME\fR, \fBAppData\fR
+Determine where the connections and aliases files are read from, via Go's
+\fBos.UserConfigDir()\fR\&.
+
+.TP
+\fBXDG_CACHE_HOME\fR, \fBHOME\fR
+Determine where the shell-completion table cache is stored, via Go's
+\fBos.UserCacheDir()\fR (\fBswoof/tables/\fR beneath it).
+
+.SH FILES
+.TP
+\fB$XDG_CONFIG_HOME/swoof/connections.yaml\fR
+Named connection definitions. See \fBswoof\fP(5).
+
+.TP
+\fB$XDG_CONFIG_HOME/swoof/aliases.yaml\fR
+Named sets of tables. See \fBswoof\fP(5).
+
+.TP
+\fB$XDG_CACHE_HOME/swoof/tables/\fR\fIconn\fP\fB\&.json\fR
+Cached table lists per connection, used for shell completion. Refreshed on
+use (1h TTL) and by \fBswoof -refresh-completions\fR\&.
+
+.SH SEE ALSO
+\fBswoof\fP(5)
+
+.PP
+Project home and full documentation:
+
+\[la]https://github.com/StirlingMarketingGroup/swoof\[ra]
+
+.PP
+MySQL DSN format:
+
+\[la]https://github.com/go\-sql\-driver/mysql#dsn\-data\-source\-name\[ra]
+
+.SH REPORTING BUGS
+Report bugs at 
+\[la]https://github.com/StirlingMarketingGroup/swoof/issues\[ra]\&.
+
+.SH AUTHOR
+Written by Stirling Marketing Group.
