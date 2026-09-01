@@ -13,7 +13,7 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/posener/cmd v1.3.4
 	github.com/rivo/tview v0.42.0
-	golang.design/x/clipboard v0.8.0
+	golang.design/x/clipboard v0.9.0
 	golang.org/x/mod v0.40.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/term v0.45.0
