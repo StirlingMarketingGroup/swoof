@@ -1,6 +1,6 @@
 module github.com/StirlingMarketingGroup/swoof
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/Ompluscator/dynamic-struct v1.3.0
@@ -15,7 +15,7 @@ require (
 	github.com/rivo/tview v0.42.0
 	golang.design/x/clipboard v0.8.0
 	golang.org/x/mod v0.40.0
-	golang.org/x/sync v0.22.0
+	golang.org/x/sync v0.23.0
 	golang.org/x/term v0.45.0
 	gopkg.in/yaml.v2 v2.4.0
 )
