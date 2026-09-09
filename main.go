@@ -83,7 +83,12 @@ var (
 	// not entirely sure how much this really affects performance,
 	// since the performance bottleneck is almost guaranteed to be writing
 	// the rows to the source
-	rowBufferSize = root.Int("r", 10_000, "max rows buffer size. Will have this many rows downloaded and ready for importing")
+	rowBufferSize = root.Int("r", 10_000, "max rows buffer size. Will have this many rows downloaded and ready for importing, rounded down to whole batches of up to 1000 rows")
+
+	// Rows travel between goroutines in slices of rowBatchSize; each channel
+	// holds rowBatchBuffer of them, so -r still bounds the rows in flight.
+	rowBatchSize   int
+	rowBatchBuffer int
 
 	whereClause = root.String("w", "", "optional WHERE clause to filter rows from the source table (e.g. \"ID > 1000\")")
 
@@ -304,6 +309,11 @@ func ensureSemverPrefix(v string) string {
 	return "v" + v
 }
 
+// maxRowBatchSize caps how many rows share one channel send. Past a few
+// hundred the per-row channel cost is already amortized to nothing, and a
+// smaller cap keeps memory per in-flight batch modest for wide rows.
+const maxRowBatchSize = 1000
+
 func main() {
 	// Reserved subcommands (completion helpers, init, man) run before the
 	// normal flag parser and without the startup banner.
@@ -316,6 +326,14 @@ func main() {
 	// parse our command line arguments and make sure we
 	// were given something that makes sense
 	root.ParseArgs(os.Args...)
+
+	if *rowBufferSize < 0 {
+		slog.Error("-r must be zero or positive", "r", *rowBufferSize)
+		os.Exit(1)
+	}
+	// -r 0 keeps its old meaning: unbuffered channels, one row at a time.
+	rowBatchSize = max(1, min(*rowBufferSize, maxRowBatchSize))
+	rowBatchBuffer = *rowBufferSize / rowBatchSize
 
 	if *refreshCompletions {
 		refreshAllConnections(*connectionsFile, refreshTimeout)
@@ -756,6 +774,7 @@ func main() {
 				// is Lambda-oriented and wrong for multi-hour table imports.
 				srcTable.SetMaxConnectionTime(0)
 				srcTable.DisableUnusedColumnWarnings = true
+				srcTable.SelectBatchSize = rowBatchSize
 				if src.Log != nil {
 					srcTable.Log = src.Log
 				}
@@ -880,6 +899,11 @@ func main() {
 				}
 
 				structType := reflect.Indirect(reflect.ValueOf(rowStruct.Build().New())).Type()
+				// Rows move between the select, fan-out, and insert goroutines in
+				// slices, not one at a time: every hop is a reflect channel op,
+				// and per-batch instead of per-row cuts that overhead by the
+				// batch size (#69).
+				batchType := reflect.SliceOf(structType)
 				columnsQuoted := columnsQuotedBld.String()
 
 				// errgroup scopes the row-stream, fan-out, and per-dest insert
@@ -1027,7 +1051,7 @@ func main() {
 					// pre-insert failure would otherwise return without g.Wait(),
 					// leaking this producer blocked on a buffer with no consumer
 					// and holding a source connection across the retry.
-					srcChRef := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize)
+					srcChRef := reflect.MakeChan(reflect.ChanOf(reflect.BothDir, batchType), rowBatchBuffer)
 
 					g.Go(func() error {
 						defer srcChRef.Close()
@@ -1057,11 +1081,13 @@ func main() {
 							return nil
 						})
 					} else {
-						// Multiple destinations: fan out each row from the single source
-						// channel to per-dest channels so the source is read only once.
+						// Multiple destinations: fan out each row batch from the single
+						// source channel to per-dest channels so the source is read only
+						// once. Batches are shared, never copied; nothing downstream
+						// mutates them.
 						dstChRefs := make([]reflect.Value, len(dsts))
 						for j := range dsts {
-							dstChRefs[j] = reflect.MakeChan(reflect.ChanOf(reflect.BothDir, structType), *rowBufferSize)
+							dstChRefs[j] = reflect.MakeChan(reflect.ChanOf(reflect.BothDir, batchType), rowBatchBuffer)
 						}
 
 						g.Go(func() error {
@@ -1072,8 +1098,8 @@ func main() {
 							}()
 							doneRef := reflect.ValueOf(ctx.Done())
 							// Pre-allocated reflect.SelectCase slices — reused every
-							// iteration. Allocating fresh per-row would burn millions
-							// of tiny allocations on a big multi-dest fan-out.
+							// iteration. Allocating fresh per-batch would burn
+							// allocations on a big multi-dest fan-out.
 							recvCases := []reflect.SelectCase{
 								{Dir: reflect.SelectRecv, Chan: srcChRef},
 								{Dir: reflect.SelectRecv, Chan: doneRef},
@@ -1093,9 +1119,9 @@ func main() {
 								if !ok {
 									return nil
 								}
-								// Send to each dest channel with ctx cancellation awareness —
-								// otherwise a downed insert goroutine that stopped receiving
-								// would deadlock the fan-out.
+								// Send the batch to each dest channel with ctx cancellation
+								// awareness — otherwise a downed insert goroutine that stopped
+								// receiving would deadlock the fan-out.
 								for i := range dstChRefs {
 									sendCasesByDest[i][0].Send = val
 									if chosen, _, _ := reflect.Select(sendCasesByDest[i]); chosen == 1 {
