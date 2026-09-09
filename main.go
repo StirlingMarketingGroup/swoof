@@ -1457,7 +1457,9 @@ func main() {
 					return errors.Wrap(err, "initialize clipboard")
 				}
 
-				clipboard.Write(clipboard.FmtText, d.clipboard.Bytes())
+				if _, err := clipboard.Write(context.Background(), clipboard.FmtText, d.clipboard.Bytes()); err != nil {
+					return errors.Wrap(err, "write clipboard")
+				}
 
 				slog.Info("copied to clipboard", "size", len(d.clipboard.Bytes()))
 			}
