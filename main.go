@@ -703,9 +703,13 @@ func main() {
 
 		wg.Add(1)
 
+		// Allocate the state even without the TUI so the finished-table log
+		// reports the real row count instead of the nil receiver's 0 (#96).
 		var state *tableState
 		if u != nil {
 			state = u.State(tableName)
+		} else {
+			state = &tableState{Name: tableName}
 		}
 
 		go func() {
@@ -1045,12 +1049,9 @@ func main() {
 					if len(dsts) == 1 {
 						// Single destination: consume source channel directly.
 						g.Go(func() error {
-							inserter := tableDsts[0].I()
-							if state != nil {
-								inserter = inserter.SetAfterRowExec(func(_ time.Time) {
-									state.Increment()
-								})
-							}
+							inserter := tableDsts[0].I().SetAfterRowExec(func(_ time.Time) {
+								state.Increment()
+							})
 							if err := inserter.InsertContext(ctx, insertPrefix, srcChRef.Interface()); err != nil {
 								return errors.Wrapf(err, "insert into %q", tableName)
 							}
@@ -1109,7 +1110,7 @@ func main() {
 							g.Go(func() error {
 								inserter := tableDsts[j].I()
 								// Track progress from the first destination only.
-								if j == 0 && state != nil {
+								if j == 0 {
 									inserter = inserter.SetAfterRowExec(func(_ time.Time) {
 										state.Increment()
 									})
