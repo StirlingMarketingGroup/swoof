@@ -81,7 +81,9 @@ stability may vary wildly between servers as this increases.
 
 `-r` *n*
 : Max rows buffer size; this many rows are downloaded and kept ready for
-importing (default 10000).
+importing (default 10000). Rows move between the download and import
+goroutines in batches of up to 1000, so *n* is rounded down to a whole
+number of batches.
 
 `-w` *clause*
 : Optional WHERE clause used to filter rows from the source table, e.g.

@@ -97,7 +97,9 @@ stability may vary wildly between servers as this increases.
 .TP
 \fB-r\fR \fIn\fP
 Max rows buffer size; this many rows are downloaded and kept ready for
-importing (default 10000).
+importing (default 10000). Rows move between the download and import
+goroutines in batches of up to 1000, so \fIn\fP is rounded down to a whole
+number of batches.
 
 .TP
 \fB-w\fR \fIclause\fP
