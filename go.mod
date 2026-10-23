@@ -8,7 +8,7 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/fatih/color v1.19.0
 	github.com/gdamore/tcell/v2 v2.13.10
-	github.com/gen2brain/beeep v0.11.2
+	github.com/gen2brain/beeep v0.11.3
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/pkg/errors v0.9.1
 	github.com/posener/cmd v1.3.4
