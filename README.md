@@ -128,13 +128,29 @@ The full table structure (schema, triggers, constraints) is always synced — on
 
 If you use `-w` with multiple tables, the same WHERE clause is applied to all of them, so make sure the referenced columns exist on each table.
 
+### Fixing schema drift
+
+A dev database can fall behind prod even when no table is missing. `-diff` shows what differs, and `-drifted` selects those tables for import:
+
+```sh
+swoof -diff prod localhost
+swoof -missing -drifted prod localhost
+```
+
+- `-drifted` re-imports each selected table with its rows. Add `-missing` to import the tables the destination lacks as well.
+- `-n` with `-drifted` replaces those tables with empty ones.
+- `-w` with `-drifted` keeps only the matching rows.
+- `-insert-ignore` can't be combined with `-drifted`, because it keeps the existing table definition.
+- `-drifted` covers tables only. `-funcs`, `-views`, and `-procs` import all of their objects, or only the missing ones when `-missing` is also set.
+
 ### Flags
 
 - `-c` your connections file (default `~/.config/swoof/connections.yaml` on Linux, more info below)
 - `-a` your alises file (default `~/.config/swoof/aliases.yaml` on Linux, more info below)
 - `-all` grabs all tables, specified tables/aliases are ignored (default false)
-- `-diff` / `-d` lists the tables, views, functions, and procedures that exist on the source but are missing from the destination, then exits without making changes (requires a single database destination)
+- `-diff` / `-d` lists the tables, views, functions, and procedures missing from the destination, plus the tables that exist on both sides with a different definition, then exits without making changes (requires a single database destination). It names each column, index, foreign key, and trigger that differs. It ignores column order, comments, table options, check constraints, and AUTO_INCREMENT counter values
 - `-missing` / `-m` selects only the objects missing from the destination — like `-all`, but filtered to what the destination lacks (tables always; funcs/views/procs when their flags are also set)
+- `-drifted` selects only the tables that exist on both sides with a different definition. See [Fixing schema drift](#fixing-schema-drift)
 - `-funcs` imports all functions after tables
 - `-views` imports all views after tables and functions
 - `-procs` imports all procedures after tables, functions, and views

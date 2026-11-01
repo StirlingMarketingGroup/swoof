@@ -74,11 +74,13 @@ var (
 
 	refreshCompletions = root.Bool("refresh-completions", false, "refreshes the cached table lists used for shell completion for every source-capable named connection, then exits")
 
-	diffLong  = root.Bool("diff", false, "lists source tables, views, functions, and procedures missing from the destination, then exits")
+	diffLong  = root.Bool("diff", false, "lists objects missing from the destination and tables that differ from the source, then exits")
 	diffShort = root.Bool("d", false, "alias for -diff")
 
 	missingLong  = root.Bool("missing", false, "selects only the objects missing from the destination (like -all, but filtered to what the destination lacks)")
 	missingShort = root.Bool("m", false, "alias for -missing")
+
+	drifted = root.Bool("drifted", false, "selects only the tables that exist on both sides with a different definition; combine with -missing to select both")
 
 	// not entirely sure how much this really affects performance,
 	// since the performance bottleneck is almost guaranteed to be writing
@@ -341,6 +343,7 @@ func main() {
 
 	diffMode := *diffLong || *diffShort
 	missingMode := *missingLong || *missingShort
+	driftedMode := *drifted
 
 	if *skipData {
 		*noProgressBars = true
@@ -618,26 +621,31 @@ func main() {
 		dsts = append(dsts, destInfo{db, destIsPath, destIsClipboard, clipboardBuf})
 	}
 
-	// -diff / -missing compare the source against a single database destination.
-	var missing *missingObjects
-	if diffMode || missingMode {
+	// -diff / -missing / -drifted compare the source against a single database
+	// destination.
+	var diff *schemaDiff
+	if diffMode || missingMode || driftedMode {
 		if len(dsts) != 1 || dsts[0].isPath || dsts[0].isClipboard {
-			fatalSetup("-diff and -missing require exactly one database destination")
+			fatalSetup("-diff, -missing, and -drifted require exactly one database destination")
+		}
+		if driftedMode && *insertIgnoreInto {
+			fatalSetup("-drifted cannot be combined with -insert-ignore, which keeps the existing table definition")
 		}
 		setupStatus("comparing source and destination...")
-		missing, err = computeMissingObjects(src, dsts[0].db)
+		diff, err = computeSchemaDiff(src, dsts[0].db)
 		if err != nil {
 			fatalSetup("failed to compare source and destination", "error", err)
 		}
 		if diffMode {
-			printDiffReport(destFriendlyNames[0], missing)
+			printDiffReport(destFriendlyNames[0], diff)
 			os.Exit(0)
 		}
 	}
 
 	var tableNames *[]string
-	if missingMode {
-		tableNames = &missing.Tables
+	if missingMode || driftedMode {
+		selected := diff.selectedTables(missingMode, driftedMode)
+		tableNames = &selected
 	} else {
 		setupStatus("resolving tables...")
 		tableNames, err = getTables(*aliasesFiles, *all, args, src)
@@ -1307,7 +1315,7 @@ func main() {
 			}
 
 			if missingMode {
-				keep := sliceToSet(missing.Funcs)
+				keep := sliceToSet(diff.Missing.Funcs)
 				filtered := srcFuncs[:0]
 				for _, f := range srcFuncs {
 					if keep[f.FuncName] {
@@ -1362,7 +1370,7 @@ func main() {
 			}
 
 			if missingMode {
-				keep := sliceToSet(missing.Views)
+				keep := sliceToSet(diff.Missing.Views)
 				filtered := srcViews[:0]
 				for _, v := range srcViews {
 					if keep[v.ViewName] {
@@ -1417,7 +1425,7 @@ func main() {
 			}
 
 			if missingMode {
-				keep := sliceToSet(missing.Procs)
+				keep := sliceToSet(diff.Missing.Procs)
 				filtered := srcProcs[:0]
 				for _, p := range srcProcs {
 					if keep[p.ProcName] {

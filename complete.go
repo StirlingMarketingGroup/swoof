@@ -14,7 +14,7 @@ import (
 var completionFlags = []string{
 	"-a", "-c", "-n", "-t", "-all", "-insert-ignore", "-dry-run", "-v",
 	"-funcs", "-views", "-procs", "-no-progress", "-version", "-skip-count",
-	"-r", "-w", "-p", "-refresh-completions", "-diff", "-d", "-missing", "-m",
+	"-r", "-w", "-p", "-refresh-completions", "-diff", "-d", "-missing", "-m", "-drifted",
 	"-h", "-help",
 }
 
