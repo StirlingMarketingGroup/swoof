@@ -50,15 +50,25 @@ The connection and alias file formats are documented in **swoof**(5).
 : Grab all tables; specified tables are ignored.
 
 `-diff`, `-d`
-: List the tables, views, functions, and stored procedures that exist on the
-source but are missing from the destination, then exit without making any
-changes. Requires exactly one database destination.
+: List the tables, views, functions, and stored procedures missing from the
+destination, plus the tables that exist on both sides with a different
+definition, then exit without making any changes. Names each column, index,
+foreign key, and trigger that differs. Ignores column order, comments, table
+options, check constraints, and AUTO_INCREMENT counter values. Requires exactly
+one database destination.
 
 `-missing`, `-m`
 : Select only the objects missing from the destination, like `-all` but
 filtered to what the destination lacks. Applies to tables, and — when the
 corresponding `-funcs`/`-views`/`-procs` flags are given — to functions,
 views, and procedures. Requires exactly one database destination.
+
+`-drifted`
+: Select only the tables that exist on both sides with a different definition.
+Each selected table is re-imported with its rows. Combine with `-missing` to
+select both. With `-n` those tables are replaced with empty ones, and with `-w`
+only the matching rows are kept. Cannot be combined with `-insert-ignore`, which
+keeps the existing table definition. Requires exactly one database destination.
 
 `-n`
 : Drop/create tables and triggers only, without importing data.
