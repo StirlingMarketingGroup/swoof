@@ -157,7 +157,7 @@ swoof -missing -drifted prod localhost
 - `-n` drop/create tables and triggers only, without importing data
 - `-p` prefix of the temp table used for initial creation before the swap and drop (default `_swoof_`)
 - `-r` value
-    max rows buffer size. Will have this many rows downloaded and ready for importing, or in Go terms, the channel size used to communicate the rows (default 10000)
+    max rows buffer size. Will have this many rows downloaded and ready for importing. Rows move between the download and import goroutines in batches of up to 1000, so this is rounded down to a whole number of batches (default 10000)
 - `-t` value
     max concurrent tables at the same time (default 4)
 - `-v` writes all queries to stdout (default false)
