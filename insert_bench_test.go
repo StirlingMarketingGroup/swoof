@@ -132,3 +132,44 @@ func makeBenchRow(t reflect.Type, i int) reflect.Value {
 
 	return v
 }
+
+// BenchmarkInsertRowBuildChanBatched is the shape main.go uses since #69: the
+// same rows, but sent through the reflect.Chan in slices of 1000 so the
+// channel and boxing cost is paid once per batch instead of once per row.
+func BenchmarkInsertRowBuildChanBatched(b *testing.B) {
+	structType := buildBenchStructType()
+	rowsPerBatch := 5_000
+	batchSize := 1_000
+
+	db, err := mysql.NewWriter(io.Discard)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	sliceType := reflect.SliceOf(structType)
+	rows := reflect.MakeSlice(sliceType, rowsPerBatch, rowsPerBatch)
+	for i := range rowsPerBatch {
+		rows.Index(i).Set(makeBenchRow(structType, i))
+	}
+
+	chanType := reflect.ChanOf(reflect.BothDir, sliceType)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		ch := reflect.MakeChan(chanType, 10)
+
+		go func() {
+			defer ch.Close()
+			for i := 0; i < rowsPerBatch; i += batchSize {
+				ch.Send(rows.Slice(i, i+batchSize))
+			}
+		}()
+
+		if err := db.I().InsertContext(b.Context(),
+			benchInsertQuery, ch.Interface()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
